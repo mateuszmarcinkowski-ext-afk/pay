@@ -13,6 +13,7 @@ yarn.lock
 pnpm-lock.yaml
 !typescript/pnpm-lock.yaml
 !pdb/pnpm-lock.yaml
+!demo-server/package-lock.json
 bun.lock
 bun.lockb
 tsconfig.tsbuildinfo
@@ -45,3 +46,11 @@ pay-account-*.json
 # .config/pay/accounts.yml; only the paywall config is safe to track.
 /.home/*
 !/.home/batch-only.yaml
+!/.home/market-gate.yaml
+
+# Agent skill install, written by the skill installer into the rust workspace.
+# Vendored copy of an upstream skill plus its lockfile: local tooling state,
+# not source.
+rust/.agents/
+rust/.claude/
+rust/skills-lock.json
