@@ -148,3 +148,9 @@ solana-sanitize = "3.0"
 solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "~4.1"
+
+# agave#15100 (open): released solana-remote-wallet rejects the seven-field
+# app-configuration vector returned by Solana app >= 1.16, so a Ledger running
+# it never enumerates. Minimal equivalent of the PR: accept len >= 5.
+[patch.crates-io]
+solana-remote-wallet = { path = "../vendor/solana-remote-wallet" }
