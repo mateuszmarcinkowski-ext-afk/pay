@@ -587,7 +587,7 @@ pub fn build_batch_payment(
     // The advertised token program is checked against the mint's real owner:
     // every associated token address in the `open` derives from it, so trusting
     // a wrong value would escrow into accounts the program never touches.
-    let terms = batch_client::resolve_terms(&rpc, requirements, None)
+    let terms = batch_client::resolve_terms(&rpc, requirements, signer.max_tx_version())
         .map_err(|e| Error::Mpp(format!("batch-settlement terms rejected: {e}")))?;
 
     let (channel, payload, voucher) = match existing {
