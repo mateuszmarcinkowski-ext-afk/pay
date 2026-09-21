@@ -1,0 +1,35 @@
+name: batchtest
+subdomain: batchtest
+title: "Batch settlement test"
+description: "One escrow channel backing many cheap requests."
+category: ai_ml
+version: v1
+routing:
+  type: respond
+accounting: pooled
+
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: "localnet"
+  fee_payer: true
+  challenge_binding_secret: "${MPP_SECRET_KEY}"
+  realm: "batchtest"
+
+batch_settlement:
+  settlement_interval_ms: 10000
+  idle_settlement_delay_ms: 600000
+
+endpoints:
+  - method: GET
+    path: "v1/tick"
+    resource: "tick"
+    description: "Cheap request backed by a batch-settlement channel."
+    metering:
+      schemes: [x402-batch-settlement]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.0001
