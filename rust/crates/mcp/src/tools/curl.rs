@@ -12,6 +12,27 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+/// How many requests a new batch-settlement channel escrows for.
+///
+/// The MCP server is a long-lived host, so one `open` should back a whole
+/// session of cheap calls rather than only the request that triggered it.
+/// Escrow left unspent returns to the payer once the withdraw delay elapses,
+/// so oversizing costs liquidity, not money.
+// todo: fixed multiple, make it configurable if hosts need longer sessions
+const BATCH_DEPOSIT_REQUESTS: u64 = 100;
+
+/// An open client-signed channel plus the unit price bound at `open`.
+///
+/// The price is kept alongside the handle because a cache hit has no fresh
+/// challenge to read it from. A stale price is self-correcting: the gateway
+/// rejects the voucher, the entry is evicted, and the next request renegotiates
+/// from the 402.
+#[derive(Clone)]
+struct ClientSession {
+    handle: pay_core::session::SessionHandle,
+    unit_price: u64,
+}
+
 /// Reusable MPP session authorizations for one MCP server connection.
 ///
 /// The `PayMcp` instance is created for one stdio MCP connection. Keys are
@@ -31,6 +52,16 @@ pub(crate) struct SessionCache {
     /// long-lived MCP connection reuse one channel instead of opening a new
     /// channel per request. It currently tops up one request at a time.
     pub(crate) batch_channels: pay_core::client::batch::BatchChannelCache,
+    /// Open client-signed MPP session channels for this connection.
+    ///
+    /// An operator-signed channel hands back one reusable `use` header, so
+    /// `authorizations` above is all it needs. A client-signed channel instead
+    /// signs a fresh voucher at a higher watermark per request, so the handle
+    /// itself has to survive between requests. Because that handle owns the
+    /// channel's ephemeral voucher key, keeping it here is what lets one wallet
+    /// approval at `open` cover every later request on the connection — which
+    /// is the only way a hardware wallet can drive a session at all.
+    client_sessions: Mutex<HashMap<String, ClientSession>>,
 }
 
 impl SessionCache {
@@ -44,9 +75,22 @@ impl SessionCache {
         }
     }
 
+    fn client_session(&self, origin: &str) -> Option<ClientSession> {
+        self.client_sessions.lock().ok()?.get(origin).cloned()
+    }
+
+    fn store_client_session(&self, origin: String, session: ClientSession) {
+        if let Ok(mut sessions) = self.client_sessions.lock() {
+            sessions.insert(origin, session);
+        }
+    }
+
     fn remove(&self, origin: &str) {
         if let Ok(mut authorizations) = self.authorizations.lock() {
             authorizations.remove(origin);
+        }
+        if let Ok(mut sessions) = self.client_sessions.lock() {
+            sessions.remove(origin);
         }
     }
 }
@@ -952,14 +996,28 @@ fn do_paid_fetch(
         _ => extra_headers.to_vec(),
     };
     let session_key = session_cache_key(method, url).ok();
-    let cached_session = session_key.as_deref().and_then(|key| {
-        (!initial_headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")))
-        .then(|| session_cache.authorization(key))
-        .flatten()
-    });
-    if let Some(authorization) = cached_session.as_ref() {
+    let caller_set_authorization = initial_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+    // The two session modes reuse a channel differently: an operator-signed one
+    // replays the payer proof bound at open, a client-signed one has to sign a
+    // voucher now, above the last watermark the gateway accepted.
+    let cached_client_session = session_key
+        .as_deref()
+        .filter(|_| !caller_set_authorization)
+        .and_then(|key| session_cache.client_session(key));
+    let cached_session = session_key
+        .as_deref()
+        .filter(|_| !caller_set_authorization && cached_client_session.is_none())
+        .and_then(|key| session_cache.authorization(key));
+    if let Some(session) = cached_client_session.as_ref() {
+        // todo: the handle advances its watermark when it signs, not when the
+        // gateway confirms, so a request that fails in flight leaves this client
+        // authorizing slightly more than it consumed. Switch to prepare/commit
+        // vouchers if a channel ever has to run close to its deposit.
+        let voucher = pay_core::session::voucher_header_sync(&session.handle, session.unit_price)?;
+        initial_headers.push(("Authorization".to_string(), voucher));
+    } else if let Some(authorization) = cached_session.as_ref() {
         initial_headers.push(("Authorization".to_string(), authorization.clone()));
     }
 
@@ -971,7 +1029,7 @@ fn do_paid_fetch(
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
-    if cached_session.is_some()
+    if (cached_session.is_some() || cached_client_session.is_some())
         && !matches!(&outcome, RunOutcome::Completed { .. })
         && let Some(key) = session_key.as_deref()
     {
@@ -1091,7 +1149,7 @@ fn do_paid_fetch(
                 &challenge,
                 store,
                 &session_cache.batch_channels,
-                None,
+                batch_deposit(&challenge),
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
@@ -1125,7 +1183,7 @@ fn do_paid_fetch(
                     corrective,
                     store,
                     &session_cache.batch_channels,
-                    None,
+                    batch_deposit(corrective),
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
@@ -1225,6 +1283,45 @@ fn do_paid_fetch(
                     "MPP session payments require an absolute HTTP(S) URL".to_string(),
                 )
             })?;
+            if pay_core::session::challenge_is_client_signed(&challenge)? {
+                let (handle, open_authorization, unit_price) =
+                    pay_core::session::open_client_signed_session(
+                        &challenge,
+                        store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        url,
+                        make_auth_override(),
+                    )?;
+                let mut headers = extra_headers.to_vec();
+                headers.push(("Authorization".to_string(), open_authorization));
+                let opened = fetch_request(&headers)?;
+
+                // `open` only registers the channel. The gateway answers
+                // payment-required until a voucher arrives, and it does so
+                // without re-advertising the session challenge, so the runner
+                // reports that second 402 as an unrecognized one. Matching only
+                // on `SessionChallenge` here would compile and do nothing.
+                let retry = match opened {
+                    RunOutcome::SessionChallenge { .. }
+                    | RunOutcome::UnknownPaymentRequired { .. } => {
+                        let voucher =
+                            pay_core::session::voucher_header_sync(&handle, unit_price)?;
+                        let mut headers = extra_headers.to_vec();
+                        headers.push(("Authorization".to_string(), voucher));
+                        fetch_request(&headers)?
+                    }
+                    settled => settled,
+                };
+                // Only keep a channel the gateway has actually served from.
+                // Once the deposit is spent the voucher is refused, the entry is
+                // evicted above, and the next request opens a fresh channel,
+                // which asks the wallet to approve a new deposit.
+                if matches!(&retry, RunOutcome::Completed { .. }) {
+                    session_cache.store_client_session(key, ClientSession { handle, unit_price });
+                }
+                return interpret_retry(retry);
+            }
             let (open_authorization, use_authorization) =
                 pay_core::session::open_operator_signed_session_authorizations(
                     &challenge,
@@ -1365,6 +1462,20 @@ fn pay_error_to_tool_result(err: pay_core::Error) -> CallToolResult {
 /// See `signer::rejection_source` for the matching producer.
 fn is_user_rejection(reason: &str) -> bool {
     reason.starts_with("rejected by user")
+}
+
+/// Escrow to request when a batch-settlement channel has to be funded.
+///
+/// `None` leaves the sizing to pay-core, which escrows exactly one request —
+/// correct for a one-shot CLI, but it makes every later request top up on
+/// chain instead of spending an off-chain voucher. An unreadable price is left
+/// for pay-core to reject with its own error.
+fn batch_deposit(challenge: &pay_core::client::x402::BatchChallenge) -> Option<u64> {
+    challenge
+        .requirements
+        .amount()
+        .ok()
+        .map(|price| price.saturating_mul(BATCH_DEPOSIT_REQUESTS))
 }
 
 /// Advance the cached channel watermark from a served response's settlement
