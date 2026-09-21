@@ -39,3 +39,9 @@ docs/benchmarks/profiles/2026-09-05-base58/
 
 # Keypair exports from `pay account export` must never be committed.
 pay-account-*.json
+
+# Demo/repro HOME for the batch-settlement runs. Everything under it is
+# local wallet state, including plaintext ephemeral secret keys in
+# .config/pay/accounts.yml; only the paywall config is safe to track.
+/.home/*
+!/.home/batch-only.yaml
