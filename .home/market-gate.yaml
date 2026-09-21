@@ -1,0 +1,111 @@
+# Tollgate Markets — paywalled synthetic market data.
+#
+# The gate holds the 402 and the batch-settlement channel; the documents
+# themselves come from a plain Express server on loopback that knows nothing
+# about payments. Paths are forwarded unchanged, so the origin sees
+# `GET /v1/spot/btc` exactly as the client asked for it.
+#
+# Three price tiers on ONE channel, which is the point of the demo: the price
+# is not a channel property, so a single deposit funds cheap snapshots and
+# expensive research notes alike.
+name: tollgate
+subdomain: tollgate
+title: "Tollgate Markets"
+description: "Synthetic market data, priced per document."
+category: ai_ml
+version: v1
+
+routing:
+  type: proxy
+  url: "http://127.0.0.1:9000"
+
+accounting: pooled
+
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: "localnet"
+  fee_payer: true
+  challenge_binding_secret: "${MPP_SECRET_KEY}"
+  realm: "tollgate"
+
+batch_settlement:
+  settlement_interval_ms: 10000
+  # Long enough that a live demo can pause between purchases without the
+  # channel settling mid-sentence.
+  idle_settlement_delay_ms: 600000
+
+endpoints:
+  - method: GET
+    path: "v1/spot/btc"
+    resource: "spot-btc"
+    description: "Bitcoin spot snapshot."
+    metering: &spot
+      schemes: [x402-batch-settlement]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.0001
+  - method: GET
+    path: "v1/spot/eth"
+    resource: "spot-eth"
+    description: "Ethereum spot snapshot."
+    metering: *spot
+  - method: GET
+    path: "v1/spot/sol"
+    resource: "spot-sol"
+    description: "Solana spot snapshot."
+    metering: *spot
+  - method: GET
+    path: "v1/spot/xrp"
+    resource: "spot-xrp"
+    description: "XRP spot snapshot."
+    metering: *spot
+  - method: GET
+    path: "v1/spot/ada"
+    resource: "spot-ada"
+    description: "Cardano spot snapshot."
+    metering: *spot
+
+  - method: GET
+    path: "v1/ohlcv/btc"
+    resource: "ohlcv-btc"
+    description: "Bitcoin daily candles, 30 days."
+    metering: &ohlcv
+      schemes: [x402-batch-settlement]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.0005
+  - method: GET
+    path: "v1/ohlcv/eth"
+    resource: "ohlcv-eth"
+    description: "Ethereum daily candles, 30 days."
+    metering: *ohlcv
+  - method: GET
+    path: "v1/ohlcv/sol"
+    resource: "ohlcv-sol"
+    description: "Solana daily candles, 30 days."
+    metering: *ohlcv
+
+  - method: GET
+    path: "v1/research/btc"
+    resource: "research-btc"
+    description: "Bitcoin research note."
+    metering: &research
+      schemes: [x402-batch-settlement]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.002
+  - method: GET
+    path: "v1/research/eth"
+    resource: "research-eth"
+    description: "Ethereum research note."
+    metering: *research
