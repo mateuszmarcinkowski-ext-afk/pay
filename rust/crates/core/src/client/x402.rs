@@ -1110,8 +1110,13 @@ pub fn build_batch_payment_checked(
     // every associated token address in the `open` derives from it, so trusting
     // a wrong value would escrow into accounts the program never touches.
     let policy = blockrun_server_signed_policy();
-    let terms = batch_client::resolve_terms_with_policy(&rpc, requirements, None, Some(&policy))
-        .map_err(|e| Error::Mpp(format!("batch-settlement terms rejected: {e}")))?;
+    let terms = batch_client::resolve_terms_with_policy(
+        &rpc,
+        requirements,
+        signer.max_tx_version(),
+        Some(&policy),
+    )
+    .map_err(|e| Error::Mpp(format!("batch-settlement terms rejected: {e}")))?;
 
     // Lazy local/dev accounts have no configured public key before signer
     // resolution. They get one final discovery attempt here.
