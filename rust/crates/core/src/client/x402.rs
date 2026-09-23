@@ -261,9 +261,6 @@ pub fn build_payment_with_override(
     };
 
     let mut headers = vec![(payment_header_name, payment_header_value)];
-    if challenge.siwx.is_some() {
-        signer.require_raw_message_signing("an x402 sign-in challenge")?;
-    }
     if let Some((header_name, header_value)) = build_siwx_header(challenge, &signer, &network, &rt)?
     {
         headers.push((header_name, header_value));
@@ -929,13 +926,18 @@ pub fn build_siwx_auth_header_with_override(
 
 fn build_siwx_header(
     challenge: &Challenge,
-    signer: &dyn TransactionSigner,
+    signer: &crate::signer::ResolvedSigner,
     network: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Result<Option<(&'static str, String)>> {
     let Some(extension) = &challenge.siwx else {
         return Ok(None);
     };
+    // The sign-in rides along with a payment only when the signer can produce it;
+    // a transactions-only signer (a Ledger) pays without it.
+    if !signer.signs_raw_messages() {
+        return Ok(None);
+    }
     let preferred_chain_id = siwx_chain_id_for_network(network);
     let chain = pay_kit::x402::siwx::select_siwx_chain(
         extension,
@@ -1683,9 +1685,12 @@ mod tests {
             72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
             246, 17, 170, 104, 17, 151, 48,
         ];
-        let signer =
-            pay_kit::x402::solana_keychain::memory::MemorySigner::from_bytes(&TEST_KEYPAIR_BYTES)
-                .unwrap();
+        let memory_signer =
+            pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&TEST_KEYPAIR_BYTES).unwrap();
+        let signer = crate::signer::ResolvedSigner::local(
+            &crate::backend::testing::SignsAnything,
+            memory_signer,
+        );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1720,6 +1725,53 @@ mod tests {
         assert_eq!(header_name, SIGN_IN_WITH_X_HEADER);
         assert_eq!(payload.chain_id, SOLANA_DEVNET);
         assert!(pay_kit::x402::siwx::verify_siwx_payload(&payload).unwrap());
+    }
+
+    #[test]
+    fn build_siwx_header_skips_sign_in_for_a_transactions_only_signer() {
+        const TEST_KEYPAIR_BYTES: [u8; 64] = [
+            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
+            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
+            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
+            246, 17, 170, 104, 17, 151, 48,
+        ];
+        let memory_signer =
+            pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&TEST_KEYPAIR_BYTES).unwrap();
+        let signer = crate::signer::ResolvedSigner::local(
+            &crate::backend::testing::TransactionsOnly,
+            memory_signer,
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let extension = pay_kit::x402::siwx::SiwxExtension::new(
+            pay_kit::x402::siwx::SiwxExtensionInfo {
+                domain: "api.example.com".to_string(),
+                uri: "https://api.example.com".to_string(),
+                statement: Some("Sign in to pay.".to_string()),
+                version: "1".to_string(),
+                nonce: "nonce-123".to_string(),
+                issued_at: "2026-04-27T00:00:00Z".to_string(),
+                expiration_time: None,
+                not_before: None,
+                request_id: None,
+                resources: None,
+            },
+            pay_kit::x402::siwx::default_solana_siwx_chains(),
+        );
+        let challenge = Challenge {
+            x402_version: X402_VERSION_V2,
+            requirements: sample_requirements(),
+            siwx: Some(extension),
+            extensions: None,
+        };
+
+        assert!(
+            build_siwx_header(&challenge, &signer, "mainnet", &rt)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
