@@ -879,7 +879,7 @@ fn validate_send_amounts(
 async fn new_mpp(
     state: &AppState,
     resolved: &ResolvedSend,
-    fee_payer_signer: Option<Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>>,
     recipient_override: Option<&str>,
 ) -> Result<Mpp, Error> {
     // `MppConfig.recipient` is what pay-kit's verify pins
@@ -917,7 +917,7 @@ async fn new_mpp(
 
 async fn fee_payer_signer(
     state: &AppState,
-) -> Result<Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>, Error> {
+) -> Result<Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>, Error> {
     crate::signer::build_fee_payer_signer(
         &state.send.fee_payer,
         "send.fee_payer.key_name is missing",

@@ -22,6 +22,10 @@ pub struct NewCommand {
     /// Replace existing account.
     #[arg(long)]
     pub force: bool,
+
+    /// BIP32 derivation path for `--backend ledger` (default: m/44'/501'/0').
+    #[arg(long)]
+    pub derivation_path: Option<String>,
 }
 
 impl NewCommand {
@@ -31,6 +35,7 @@ impl NewCommand {
             self.backend.as_deref(),
             self.vault.as_deref(),
             self.force,
+            self.derivation_path.as_deref(),
         )?;
         eprintln!();
 
@@ -57,8 +62,36 @@ pub fn create_account(
     backend: Option<&str>,
     vault: Option<&str>,
     force: bool,
+    derivation_path: Option<&str>,
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
+
+    if backend_id == "ledger" {
+        // Nothing to generate or store: the key lives on the device. Read the
+        // pubkey at the default derivation path and register the account.
+        let signer = pay_core::signer::connect_ledger(derivation_path)?;
+        let pubkey_b58 = signer.pubkey().to_string();
+        save_account(
+            name,
+            pay_core::accounts::Keystore::Ledger,
+            &pubkey_b58,
+            None,
+            None,
+            None,
+        )?;
+        if let Some(path) = derivation_path {
+            let mut accounts = pay_core::accounts::AccountsFile::load()?;
+            if let Some(acct) = accounts
+                .accounts
+                .get_mut(pay_core::accounts::MAINNET_NETWORK)
+                .and_then(|n| n.get_mut(name))
+            {
+                acct.derivation_path = Some(path.to_string());
+            }
+            accounts.save()?;
+        }
+        return Ok((pubkey_b58, "Ledger"));
+    }
 
     let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault, name)?;
 
@@ -457,6 +490,7 @@ pub fn save_account(
             vault,
             account,
             path,
+            derivation_path: None,
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),

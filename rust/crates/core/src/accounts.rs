@@ -74,7 +74,13 @@ pub enum Keystore {
     /// Inline ephemeral keypair stored directly in this file. Used for
     /// throwaway test wallets on sandbox/devnet/localnet.
     Ephemeral,
+    /// Ledger hardware wallet over USB. No secret is stored anywhere; the
+    /// device signs after on-screen confirmation.
+    Ledger,
 }
+
+/// Default Solana derivation path for Ledger accounts (matches Ledger Live).
+pub const DEFAULT_LEDGER_DERIVATION_PATH: &str = "m/44'/501'/0'";
 
 impl std::fmt::Display for Keystore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,6 +91,7 @@ impl std::fmt::Display for Keystore {
             Keystore::OnePassword => write!(f, "1password"),
             Keystore::File => write!(f, "file"),
             Keystore::Ephemeral => write!(f, "ephemeral"),
+            Keystore::Ledger => write!(f, "ledger"),
         }
     }
 }
@@ -128,6 +135,11 @@ pub struct Account {
     /// File path (only for `keystore: file`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+
+    /// BIP32 derivation path (only for `keystore: ledger`). Defaults to
+    /// [`DEFAULT_LEDGER_DERIVATION_PATH`] when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivation_path: Option<String>,
 
     /// Base58-encoded full keypair (64 bytes: secret || public). Only set
     /// for `keystore: ephemeral` — these wallets live entirely in this
@@ -304,6 +316,12 @@ impl Account {
                     .into_owned()
             })),
             Keystore::Ephemeral => None,
+            Keystore::Ledger => Some(format!(
+                "ledger:{}",
+                self.derivation_path
+                    .as_deref()
+                    .unwrap_or(DEFAULT_LEDGER_DERIVATION_PATH)
+            )),
         }
     }
 
@@ -808,6 +826,7 @@ fn generate_ephemeral_account() -> Account {
         vault: None,
         account: None,
         path: None,
+        derivation_path: None,
         secret_key_b58: Some(bs58::encode(&full).into_string()),
         created_at: Some(now_rfc3339()),
         subscriptions: BTreeMap::new(),
@@ -881,6 +900,7 @@ mod tests {
             vault: None,
             path: None,
             account: None,
+            derivation_path: None,
             secret_key_b58: None,
             created_at: None,
             subscriptions: BTreeMap::new(),
@@ -896,6 +916,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            derivation_path: None,
             secret_key_b58: Some("test-secret-bytes-base58".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: BTreeMap::new(),
@@ -976,6 +997,7 @@ mod tests {
             vault: None,
             path: Some("/home/me/.config/solana/id.json".to_string()),
             account: None,
+            derivation_path: None,
             secret_key_b58: None,
             created_at: None,
             subscriptions: BTreeMap::new(),
@@ -996,6 +1018,7 @@ mod tests {
             vault: None,
             path: None,
             account: None,
+            derivation_path: None,
             secret_key_b58: None,
             created_at: None,
             subscriptions: BTreeMap::new(),
@@ -1021,6 +1044,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            derivation_path: None,
             secret_key_b58: Some(bs58::encode(&raw_bytes).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: BTreeMap::new(),

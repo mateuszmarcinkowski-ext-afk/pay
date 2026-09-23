@@ -3,7 +3,7 @@
 //! Thin wrapper around `pay_kit::x402::client::exact` for challenge detection
 //! and payment building.
 
-use pay_kit::x402::solana_keychain::SolanaSigner;
+use pay_kit::x402::solana_keychain::TransactionSigner;
 use pay_kit::x402::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::x402::{
     PAYMENT_REQUIRED_HEADER, X402_V1_PAYMENT_REQUIRED_HEADER, X402_VERSION_FIELD, X402_VERSION_V1,
@@ -225,7 +225,7 @@ pub fn build_payment_with_override(
     let (payment_header_name, payment_header_value) = match challenge.x402_version {
         X402_VERSION_V1 => {
             let header = rt
-                .block_on(build_payment_header_v1(&signer, &rpc, requirements))
+                .block_on(build_payment_header_v1(signer.as_ref(), &rpc, requirements))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V1_PAYMENT_HEADER, header)
         }
@@ -233,7 +233,7 @@ pub fn build_payment_with_override(
             let extensions = build_outbound_extensions(challenge.extensions.as_ref())?;
             let header = rt
                 .block_on(build_payment_header_v2(
-                    &signer,
+                    signer.as_ref(),
                     &rpc,
                     requirements,
                     extensions,
@@ -244,7 +244,7 @@ pub fn build_payment_with_override(
     };
 
     let mut headers = vec![(payment_header_name, payment_header_value)];
-    if let Some((header_name, header_value)) = build_siwx_header(challenge, &signer, &network, &rt)?
+    if let Some((header_name, header_value)) = build_siwx_header(challenge, signer.as_ref(), &network, &rt)?
     {
         headers.push((header_name, header_value));
     }
@@ -389,7 +389,7 @@ pub fn build_upto_payment_with_override(
 
     let header = rt
         .block_on(pay_kit::x402::client::upto::build_upto_header(
-            &signer,
+            signer.as_ref(),
             &rpc,
             requirements,
             expires_at,
@@ -459,7 +459,7 @@ pub fn build_siwx_auth_header_with_override(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
     let header = rt
-        .block_on(create_siwx_header(&challenge.extension, &chain, &signer))
+        .block_on(create_siwx_header(&challenge.extension, &chain, signer.as_ref()))
         .map_err(|e| Error::Mpp(format!("Failed to sign x402 sign-in challenge: {e}")))?;
 
     Ok(BuiltPayment {
@@ -470,7 +470,7 @@ pub fn build_siwx_auth_header_with_override(
 
 fn build_siwx_header(
     challenge: &Challenge,
-    signer: &dyn SolanaSigner,
+    signer: &dyn TransactionSigner,
     network: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Result<Option<(&'static str, String)>> {
@@ -1256,6 +1256,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            derivation_path: None,
             secret_key_b58: Some(bs58::encode(TEST_KEYPAIR_BYTES).into_string()),
             created_at: Some("2026-04-27T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),

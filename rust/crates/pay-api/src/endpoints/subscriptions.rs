@@ -38,7 +38,7 @@ use pay_kit::mpp::program::subscriptions::{
 };
 use pay_kit::mpp::protocol::solana::MethodDetails;
 use pay_kit::mpp::server::{Config as MppConfig, Mpp};
-use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner};
+use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner, TransactionSigner};
 use pay_kit::mpp::{ChargeRequest as MppChargeRequest, PaymentCredential};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -540,7 +540,7 @@ fn validate_paid_cancel_request(
 async fn co_sign_and_broadcast(
     state: &AppState,
     resolved: &ResolvedCancel,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
 ) -> Result<Signature, Error> {
     // Broadcast path requires the full parsed tx — `verify_and_broadcast`
     // only invokes us after confirming `parsed.is_some()`.
@@ -581,7 +581,7 @@ async fn co_sign_and_broadcast(
 async fn new_mpp(
     state: &AppState,
     resolved: &ResolvedCancel,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
 ) -> Result<Mpp, Error> {
     let has_fee_payer_signer = fee_payer_signer.is_some();
     Mpp::new(MppConfig {
@@ -600,7 +600,7 @@ async fn new_mpp(
     .map_err(|_| Error::PaymentChallenge)
 }
 
-async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn SolanaSigner>, Error> {
+async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn TransactionSigner>, Error> {
     let key_name = state
         .subscriptions_fee_payer
         .key_name

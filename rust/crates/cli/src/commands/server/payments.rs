@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use pay_kit::mpp::server::Mpp;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_types::Stablecoin;
 use pay_types::metering::SignerConfig;
 
@@ -40,7 +40,7 @@ pub(crate) type GeneratedGatewayAccount = (String, String);
 /// new account was generated, so the caller can surface it in its banner.
 pub(crate) fn load_auto_fee_payer_signer(
     network: &SolanaNetwork,
-) -> pay_core::Result<(Arc<dyn SolanaSigner>, Option<GeneratedGatewayAccount>)> {
+) -> pay_core::Result<(Arc<dyn TransactionSigner>, Option<GeneratedGatewayAccount>)> {
     let auto_network = network.slug();
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let _ = pay_core::accounts::load_or_create_exact_ephemeral_for_network_as(
@@ -60,7 +60,7 @@ pub(crate) fn load_auto_fee_payer_signer(
             resolved.account.pubkey.unwrap_or_else(|| "?".to_string()),
         )
     });
-    Ok((Arc::new(signer) as Arc<dyn SolanaSigner>, generated))
+    Ok((signer, generated))
 }
 
 /// Sandbox RPC URL fallback chain.
@@ -395,7 +395,7 @@ pub(crate) async fn ensure_payout_recipient_token_accounts(
     network: &str,
     rpc_url: &str,
     allow_startup_creation: bool,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
 ) -> pay_core::Result<()> {
     if recipients.is_empty() || stable_requirements.is_empty() {
         return Ok(());
@@ -485,7 +485,7 @@ pub(crate) fn create_associated_token_account_idempotent_ix(
 }
 
 async fn sign_and_broadcast_gateway(
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     instructions: Vec<solana_instruction::Instruction>,
     rpc_url: &str,
 ) -> pay_core::Result<String> {
@@ -615,7 +615,7 @@ pub(crate) fn build_charge_mpps(
     rpc_url: &str,
     challenge_binding_secret: &str,
     fee_payer: bool,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     blockhash_cache: &pay_kit::mpp::blockhash::BlockhashCache,
 ) -> pay_core::Result<Vec<Mpp>> {
     currency_configs
@@ -654,7 +654,7 @@ pub(crate) fn build_sandbox_upto_backend(
     network_slug: &str,
     rpc_url: &str,
     resource: &str,
-    fee_payer_signer: Arc<dyn SolanaSigner>,
+    fee_payer_signer: Arc<dyn TransactionSigner>,
     blockhash_cache: &pay_kit::mpp::blockhash::BlockhashCache,
 ) -> pay_core::Result<pay_kit::x402::server::X402Upto> {
     let receiver_authorizer = fee_payer_signer.pubkey().to_string();

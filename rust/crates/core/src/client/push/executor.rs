@@ -823,6 +823,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            derivation_path: None,
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-08-12T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),

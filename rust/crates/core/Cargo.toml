@@ -65,10 +65,12 @@ dashmap = "5.5"
 reqwest = { workspace = true, features = ["json"] }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }
+solana-keychain = { version = "2.0.0-beta.1", default-features = false, features = ["memory", "ledger", "sdk-v3", "unsafe-debug"] } # unsafe-debug: demo build only, surfaces raw device errors
 bincode = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-hash = { workspace = true }
 solana-instruction = { workspace = true }
+async-trait = "0.1"
 solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }

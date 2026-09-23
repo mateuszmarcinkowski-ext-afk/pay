@@ -539,6 +539,7 @@ fn resolve_signing_account(
             vault: None,
             account: None,
             path: Some(path.to_string_lossy().to_string()),
+            derivation_path: None,
             secret_key_b58: None,
             created_at: Some(Utc::now().to_rfc3339()),
             subscriptions: BTreeMap::new(),

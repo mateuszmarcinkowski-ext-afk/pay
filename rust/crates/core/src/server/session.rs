@@ -20,7 +20,7 @@ use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineError};
 use pay_kit::mpp::blockhash::BlockhashCache;
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionOpenContext, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_kit::mpp::store::{
     ChannelLifecycle, ChannelState, ChannelStore, MemoryChannelStore, StoreError,
 };
@@ -198,8 +198,8 @@ struct SessionOperatorRuntime {
     rpc_url: Option<String>,
     network: String,
     token_program: String,
-    payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
-    payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
+    payment_channel_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
+    payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
     committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
     reserved_capacity: Arc<Mutex<HashMap<String, u64>>>,
     delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
@@ -256,14 +256,14 @@ impl SessionOperatorRuntime {
             .and_then(|sigs| sigs.get(channel_id).cloned())
     }
 
-    fn payment_channel_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
+    fn payment_channel_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
         self.payment_channel_signer
             .lock()
             .ok()
             .and_then(|signer| signer.clone())
     }
 
-    fn payment_channel_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
+    fn payment_channel_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
         self.payment_channel_payer_signer
             .lock()
             .ok()
@@ -1265,8 +1265,8 @@ pub struct SessionMpp {
     session_config: SessionConfig,
     challenge_binding_secret: String,
     realm: String,
-    payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
-    payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
+    payment_channel_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
+    payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
     committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
     lifecycle: SessionLifecycleHandle,
     operator_runtime: SessionOperatorRuntime,
@@ -1412,7 +1412,7 @@ impl SessionMpp {
 
     /// Configure the operator signer used to co-sign client-provided
     /// payment-channel open transactions and to submit close settlement txs.
-    pub fn with_payment_channel_signer(self, signer: Arc<dyn SolanaSigner>) -> Self {
+    pub fn with_payment_channel_signer(self, signer: Arc<dyn TransactionSigner>) -> Self {
         if let Ok(mut payment_channel_signer) = self.payment_channel_signer.lock() {
             *payment_channel_signer = Some(signer);
         }
@@ -1425,7 +1425,7 @@ impl SessionMpp {
     /// compatibility. Server-opened client-voucher sessions normally set this
     /// to a distinct funded payer because the payment-channel program rejects
     /// `payer == payee`.
-    pub fn with_payment_channel_payer_signer(self, signer: Arc<dyn SolanaSigner>) -> Self {
+    pub fn with_payment_channel_payer_signer(self, signer: Arc<dyn TransactionSigner>) -> Self {
         if let Ok(mut payment_channel_payer_signer) = self.payment_channel_payer_signer.lock() {
             *payment_channel_payer_signer = Some(signer);
         }
@@ -2059,6 +2059,8 @@ impl SessionMpp {
         };
         let state = ChannelState {
             channel_id: channel_id.to_string(),
+            pending_setup: None,
+            onchain_checked_at: 0,
             authorized_signer: chan.authorized_signer.to_string(),
             deposit: chan.deposit,
             cumulative: settled,
@@ -2196,6 +2198,8 @@ pub fn test_channel_state(
     let payer = payer.into();
     ChannelState {
         channel_id: channel_id.into(),
+        pending_setup: None,
+        onchain_checked_at: 0,
         authorized_signer: authorized_signer.into(),
         deposit,
         cumulative: 0,
@@ -2316,7 +2320,7 @@ mod tests {
         assert!(!session.accepts_currency(pay_kit::mpp::mints::USDG_MAINNET));
     }
 
-    fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn SolanaSigner>) {
+    fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn TransactionSigner>) {
         use ed25519_dalek::SigningKey;
 
         let sk = SigningKey::generate(&mut rand::thread_rng());
@@ -2327,7 +2331,7 @@ mod tests {
         (sk, Box::new(MemorySigner::from_bytes(&kp).unwrap()))
     }
 
-    fn test_session_signer() -> Box<dyn SolanaSigner> {
+    fn test_session_signer() -> Box<dyn TransactionSigner> {
         test_keypair().1
     }
 
@@ -3504,7 +3508,7 @@ mod tests {
 
     #[tokio::test]
     async fn delegated_usage_signs_and_persists_cumulative_voucher() {
-        let signer: Arc<dyn SolanaSigner> = Arc::from(test_session_signer());
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
         let operator = signer.pubkey();
         let mut config = test_session_config();
         config.operator = operator.to_string();

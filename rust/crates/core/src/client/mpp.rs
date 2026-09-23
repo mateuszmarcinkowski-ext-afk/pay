@@ -4,7 +4,6 @@
 
 use pay_kit::mpp::client::build_credential_header;
 use pay_kit::mpp::protocol::solana::default_rpc_url;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::mpp::{ChargeRequest, parse_www_authenticate_all};
 use pay_types::Stablecoin;
@@ -175,7 +174,7 @@ pub fn build_credential_with_override(
     }
 
     let header = rt
-        .block_on(build_credential_header(&signer, &rpc, challenge))
+        .block_on(build_credential_header(signer.as_ref(), &rpc, challenge))
         .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))?;
 
     Ok((header, ephemeral_notice))

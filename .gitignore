@@ -32,3 +32,6 @@ rust/example/node_modules
 rust/example/pnpm-lock.yaml
 *.log
 coverage*.json
+
+# vendored crate patch for the Ledger demo (agave#15100)
+/vendor/

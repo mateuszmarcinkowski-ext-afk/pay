@@ -1,6 +1,9 @@
 //! Resolve a signer from a keypair source — file path, Keychain, or 1Password.
 
-use pay_kit::mpp::solana_keychain::MemorySigner;
+use std::sync::Arc;
+
+use pay_kit::mpp::solana_keychain::{MemorySigner, TransactionSigner};
+use solana_keychain::LedgerSigner;
 
 use crate::accounts::{
     Account, AccountChoice, AccountsStore, Keystore, ResolvedEphemeral,
@@ -23,6 +26,107 @@ use crate::{Error, Result};
 /// call and threaded down through one signing operation.
 pub type AuthOverride = Option<Box<dyn AuthGate>>;
 
+/// A ready-to-use signer: in-memory key (software keystores) or a Ledger.
+pub type LoadedSigner = Arc<dyn TransactionSigner>;
+
+/// Connect to the attached Ledger and cache its pubkey at `derivation_path`.
+///
+/// Requires exactly one device with the Solana app open (auto-launched when
+/// closed). The keystore auth gate does not apply: the device screen is the
+/// confirmation step.
+pub fn connect_ledger(derivation_path: Option<&str>) -> Result<LoadedSigner> {
+    let signer = LedgerSigner::connect(derivation_path, false, None)
+        .map_err(|e| Error::Config(format!("Ledger: {e}")))?;
+    Ok(Arc::new(LedgerDebugSigner(signer)))
+}
+
+/// Demo-build shim: prints what is about to be sent to the device so a
+/// blind-signing prompt can be traced to the instruction that caused it.
+/// todo: remove or gate behind a verbose flag before anything ships.
+struct LedgerDebugSigner(LedgerSigner);
+
+#[async_trait::async_trait]
+impl pay_kit::mpp::solana_keychain::SolanaSigner for LedgerDebugSigner {
+    fn pubkey(&self) -> solana_pubkey::Pubkey {
+        self.0.pubkey()
+    }
+    async fn is_available(&self) -> bool {
+        self.0.is_available().await
+    }
+    async fn sign_message(
+        &self,
+        message: &[u8],
+    ) -> std::result::Result<solana_signature::Signature, pay_kit::mpp::solana_keychain::SignerError>
+    {
+        eprintln!("[ledger] sign_message: {} bytes (off-chain envelope)", message.len());
+        self.0.sign_message(message).await
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionSigner for LedgerDebugSigner {
+    async fn sign_transaction(
+        &self,
+        tx: &mut solana_transaction::versioned::VersionedTransaction,
+    ) -> std::result::Result<
+        pay_kit::mpp::solana_keychain::SignTransactionResult,
+        pay_kit::mpp::solana_keychain::SignerError,
+    > {
+        let keys = tx.message.static_account_keys();
+        eprintln!(
+            "[ledger] sign_transaction: {} instruction(s), {} account(s), version={}",
+            tx.message.instructions().len(),
+            keys.len(),
+            match &tx.message {
+                solana_message::VersionedMessage::Legacy(_) => "legacy",
+                solana_message::VersionedMessage::V0(_) => "v0",
+            }
+        );
+        for (i, k) in keys.iter().enumerate() {
+            eprintln!("[ledger]   key{i}: {k}");
+        }
+        for (i, ix) in tx.message.instructions().iter().enumerate() {
+            let program = keys
+                .get(ix.program_id_index as usize)
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "?".into());
+            let data: Vec<String> = ix.data.iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!(
+                "[ledger]   ix{i}: program={program} accounts={:?} data={}",
+                ix.accounts,
+                data.join("")
+            );
+        }
+        if std::env::var_os("PAY_LEDGER_DRY_RUN").is_some() {
+            eprintln!("[ledger] PAY_LEDGER_DRY_RUN set: not sending to device");
+            return Err(pay_kit::mpp::solana_keychain::SignerError::Other(
+                "dry run".to_string(),
+            ));
+        }
+        let result = self.0.sign_transaction(tx).await;
+        if let Err(e) = &result {
+            use pay_kit::mpp::solana_keychain::SignerError as E;
+            let detail = match e {
+                E::SigningFailed(d) | E::UserRejected(d) | E::NotAvailable(d) | E::Other(d) => {
+                    d.as_str()
+                }
+                _ => "",
+            };
+            eprintln!("[ledger] device error: {e} | {detail}");
+        }
+        result
+    }
+}
+
+fn ledger_signer_for_account(account: &Account) -> Result<LoadedSigner> {
+    connect_ledger(Some(
+        account
+            .derivation_path
+            .as_deref()
+            .unwrap_or(crate::accounts::DEFAULT_LEDGER_DERIVATION_PATH),
+    ))
+}
+
 /// Load a `MemorySigner` from the given source.
 ///
 /// - `keychain:<account>` — load from macOS Keychain (triggers Touch ID)
@@ -30,13 +134,13 @@ pub type AuthOverride = Option<Box<dyn AuthGate>>;
 /// - `windows-hello:<account>` — load from Windows Credential Manager (triggers Windows Hello)
 /// - `1password:<account>` — load from 1Password (triggers `op` CLI auth)
 /// - anything else — treat as a file path
-pub fn load_signer(source: &str) -> Result<MemorySigner> {
+pub fn load_signer(source: &str) -> Result<LoadedSigner> {
     load_signer_with_intent(source, &AuthIntent::default_payment())
 }
 
 /// Load a signer for a payment, prefixing rejection errors with the amount
 /// (e.g. "$0.10 payment authorization was rejected by user at Apple Keychain").
-pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result<MemorySigner> {
+pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result<LoadedSigner> {
     let intent = AuthIntent::authorize_payment(amount, desc);
     load_signer_with_intent(source, &intent).map_err(|e| match e {
         Error::PaymentRejected(where_) => {
@@ -70,7 +174,7 @@ pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result
 pub fn load_signer_for_network(
     network: &str,
     store: &dyn AccountsStore,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(LoadedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent(network, store, None, &AuthIntent::default_payment())
 }
 
@@ -82,7 +186,7 @@ pub fn load_signer_for_network_with_reason(
     store: &dyn AccountsStore,
     account_override: Option<&str>,
     reason: &str,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(LoadedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent(
         network,
         store,
@@ -98,7 +202,7 @@ pub fn load_signer_for_network_with_intent(
     store: &dyn AccountsStore,
     account_override: Option<&str>,
     intent: &AuthIntent,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(LoadedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent_and_override(network, store, account_override, intent, None)
 }
 
@@ -110,7 +214,7 @@ pub fn load_signer_for_network_with_intent_and_override(
     account_override: Option<&str>,
     intent: &AuthIntent,
     auth_override: AuthOverride,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(LoadedSigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
     if let Some(name) = account_override {
         if let Some(account) = file.named_account_for_network(network, name).cloned() {
@@ -166,7 +270,7 @@ pub fn load_signer_for_network_payment(
     account_override: Option<&str>,
     amount: &str,
     desc: &str,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(LoadedSigner, Option<ResolvedEphemeral>)> {
     let intent = AuthIntent::authorize_payment(amount, desc);
     load_signer_for_network_payment_with_intent(network, store, account_override, amount, &intent)
 }
@@ -177,7 +281,7 @@ pub fn load_signer_for_network_payment_with_intent(
     account_override: Option<&str>,
     amount: &str,
     intent: &AuthIntent,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(LoadedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_payment_with_intent_and_override(
         network,
         store,
@@ -197,7 +301,7 @@ pub fn load_signer_for_network_payment_with_intent_and_override(
     amount: &str,
     intent: &AuthIntent,
     auth_override: AuthOverride,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(LoadedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent_and_override(
         network,
         store,
@@ -253,6 +357,11 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
     auth_override: AuthOverride,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let account_intent = intent.with_account_context(name);
+    if account.keystore == Keystore::Ledger {
+        return Err(Error::Config(format!(
+            "Account `{name}` is a Ledger; it has no exportable key"
+        )));
+    }
     if account.keystore == Keystore::Ephemeral {
         let _ = auth_override;
         return account
@@ -379,7 +488,7 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
             maybe_authenticate_file_account(account, network, &account_intent, auth_override)?;
             load_signer_keypair_bytes_with_intent(&source, &account_intent)
         }
-        Keystore::Ephemeral => unreachable!("handled above"),
+        Keystore::Ephemeral | Keystore::Ledger => unreachable!("handled above"),
     }
 }
 
@@ -388,19 +497,23 @@ pub fn load_signer_from_account_with_reason(
     name: &str,
     network: &str,
     reason: &str,
-) -> Result<MemorySigner> {
+) -> Result<LoadedSigner> {
+    if account.keystore == Keystore::Ledger {
+        return ledger_signer_for_account(account);
+    }
     let bytes = load_keypair_bytes_from_account_with_intent(
         account,
         name,
         network,
         &AuthIntent::from_reason(reason),
     )?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| {
+    let signer = MemorySigner::from_bytes(&bytes).map_err(|e| {
         Error::Config(format!(
             "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
              Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
         ))
-    })
+    })?;
+    Ok(Arc::new(signer))
 }
 
 pub fn load_signer_from_account_with_intent(
@@ -408,7 +521,7 @@ pub fn load_signer_from_account_with_intent(
     name: &str,
     network: &str,
     intent: &AuthIntent,
-) -> Result<MemorySigner> {
+) -> Result<LoadedSigner> {
     load_signer_from_account_with_intent_and_override(account, name, network, intent, None)
 }
 
@@ -420,7 +533,10 @@ pub fn load_signer_from_account_with_intent_and_override(
     network: &str,
     intent: &AuthIntent,
     auth_override: AuthOverride,
-) -> Result<MemorySigner> {
+) -> Result<LoadedSigner> {
+    if account.keystore == Keystore::Ledger {
+        return ledger_signer_for_account(account);
+    }
     let bytes = load_keypair_bytes_from_account_with_intent_and_override(
         account,
         name,
@@ -428,20 +544,22 @@ pub fn load_signer_from_account_with_intent_and_override(
         intent,
         auth_override,
     )?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| {
+    let signer = MemorySigner::from_bytes(&bytes).map_err(|e| {
         Error::Config(format!(
             "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
              Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
         ))
-    })
+    })?;
+    Ok(Arc::new(signer))
 }
 
-fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
+fn signer_from_ephemeral(account: &Account) -> Result<LoadedSigner> {
     let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
         Error::Config("Ephemeral account is missing its inline `secret_key_b58` field".to_string())
     })?;
-    MemorySigner::from_bytes(&bytes)
-        .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
+    let signer = MemorySigner::from_bytes(&bytes)
+        .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))?;
+    Ok(Arc::new(signer))
 }
 
 /// Apply a file-backed account's auth policy before reading its keypair.
@@ -500,19 +618,23 @@ fn map_file_auth_error(e: crate::keystore::Error) -> Error {
 }
 
 /// Load a `MemorySigner` with a custom reason string.
-pub fn load_signer_with_reason(source: &str, reason: &str) -> Result<MemorySigner> {
+pub fn load_signer_with_reason(source: &str, reason: &str) -> Result<LoadedSigner> {
     load_signer_with_intent(source, &AuthIntent::from_reason(reason))
 }
 
 /// Load a `MemorySigner` with a typed auth intent.
-pub fn load_signer_with_intent(source: &str, intent: &AuthIntent) -> Result<MemorySigner> {
+pub fn load_signer_with_intent(source: &str, intent: &AuthIntent) -> Result<LoadedSigner> {
+    if let Some(path) = source.strip_prefix("ledger:") {
+        return connect_ledger(Some(path));
+    }
     let bytes = load_signer_keypair_bytes_with_intent(source, intent)?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| {
+    let signer = MemorySigner::from_bytes(&bytes).map_err(|e| {
         Error::Config(format!(
             "Storage corrupted: keypair from `{source}` failed to decode ({e}). \
              Re-import this keypair via `pay account new` or `pay account import`."
         ))
-    })
+    })?;
+    Ok(Arc::new(signer))
 }
 
 pub fn load_signer_keypair_bytes_with_reason(
@@ -526,6 +648,11 @@ pub fn load_signer_keypair_bytes_with_intent(
     source: &str,
     intent: &AuthIntent,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
+    if source.starts_with("ledger:") {
+        return Err(Error::Config(
+            "Ledger accounts have no exportable key; the device signs directly".to_string(),
+        ));
+    }
     if let Some(account) = source.strip_prefix("keychain:") {
         load_from_keystore_backend("keychain", account, intent)
     } else if let Some(account) = source.strip_prefix("gnome-keyring:") {
@@ -796,6 +923,7 @@ mod tests {
             vault: None,
             account: None,
             path: Some(key_path.to_string_lossy().into_owned()),
+            derivation_path: None,
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),
@@ -891,6 +1019,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            derivation_path: None,
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
@@ -1082,6 +1211,7 @@ mod tests {
             vault: None,
             path: None,
             account: None,
+            derivation_path: None,
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),

@@ -114,6 +114,7 @@ impl ImportCommand {
                 vault: self.vault,
                 path: None,
                 account: None,
+                derivation_path: None,
                 secret_key_b58: None,
                 created_at: None,
                 subscriptions: std::collections::BTreeMap::new(),

@@ -732,7 +732,7 @@ impl<S: PaymentState> PaymentGate<S> {
             && let Some(batch) = self.state.x402_batch()
         {
             let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
-            match batch.payment_required_header(&amount) {
+            match batch.payment_required_header(&amount, None) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
                         HeaderName::from_bytes(name.as_bytes()),
@@ -1006,8 +1006,33 @@ impl<S: PaymentState> PaymentGate<S> {
             });
         match batch.verify_payment(pay_header, &amount).await {
             Ok(outcome) => {
+                let serve = outcome.serve;
+                let reference = Some(outcome.channel_id.clone());
+                // todo: pay-kit main split batch settlement into verify ->
+                // serve -> finish_commit; charging before forwarding mirrors
+                // the pre-2.x behaviour. Port to the two-phase flow when the
+                // gate grows a post-handler hook.
+                let response = match batch.settle_payment(outcome).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        telemetry::record_settlement_error(
+                            "x402/batch",
+                            subdomain,
+                            path,
+                            &e.to_string(),
+                            true,
+                        );
+                        return GateDecision::Respond(GateResponse::json(
+                            StatusCode::BAD_GATEWAY,
+                            serde_json::to_vec(
+                                &json!({"error":"settlement_failed","message":e.to_string()}),
+                            )
+                            .unwrap_or_default(),
+                        ));
+                    }
+                };
                 let mut headers = Vec::new();
-                if let Ok((name, value)) = batch.settlement_header(&outcome.response)
+                if let Ok((name, value)) = batch.settlement_header(&response)
                     && let (Ok(n), Ok(v)) = (
                         HeaderName::from_bytes(name.as_bytes()),
                         HeaderValue::from_str(&value),
@@ -1015,12 +1040,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 {
                     headers.push((n, v));
                 }
-                let reference = outcome
-                    .response
-                    .channel_state
-                    .as_ref()
-                    .map(|c| c.channel_id.clone());
-                if outcome.serve {
+                if serve {
                     if let Some(r) = &reference {
                         telemetry::record_payment_collected(
                             "x402/batch",

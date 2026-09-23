@@ -23,7 +23,7 @@ use std::sync::Arc;
 use pay_kit::mpp::{
     PaymentChallenge, parse_www_authenticate,
     program::subscriptions::{default_program_id, find_subscription_pda, parse_pubkey},
-    solana_keychain::SolanaSigner,
+    solana_keychain::TransactionSigner,
 };
 
 use crate::accounts::{AccountsStore, Subscription, SubscriptionStatus};
@@ -69,7 +69,7 @@ pub async fn sign_and_persist(
     plan_id: &str,
     program_id_override: Option<&str>,
     challenge: &PaymentChallenge,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
 ) -> Result<String> {
     let plan_pubkey = parse_pubkey(plan_id, "plan_id")
         .map_err(|e| Error::Mpp(format!("Invalid plan_id: {e}")))?;
@@ -281,6 +281,7 @@ mod tests {
                 vault: None,
                 account: None,
                 path: None,
+                derivation_path: None,
                 secret_key_b58: None,
                 created_at: None,
                 subscriptions,

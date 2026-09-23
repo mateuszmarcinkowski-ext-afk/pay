@@ -57,7 +57,7 @@ pub struct OperatorDefaults<'a> {
     /// — the SDK's verify path co-signs the activation transaction
     /// with it before broadcasting. The middleware threads it through
     /// from `PaymentState::fee_payer_signer`.
-    pub fee_payer_signer: Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>>,
+    pub fee_payer_signer: Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>>,
 }
 
 /// Resolve `(amount_base_units, decimals, mint_b58)` from the endpoint
@@ -332,7 +332,7 @@ pub async fn check_plan_exists(
 pub async fn publish_plan(
     spec: &SubscriptionEndpoint,
     operator: &solana_pubkey::Pubkey,
-    operator_signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
+    operator_signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>,
     rpc_url: &str,
     plan_id_numeric: u64,
 ) -> Result<PublishedPlan> {
@@ -451,7 +451,7 @@ async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) 
 /// and broadcast through `send_and_confirm_transaction`. Returns the
 /// settlement signature as base58.
 async fn sign_and_broadcast(
-    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
+    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>,
     instructions: Vec<solana_instruction::Instruction>,
     rpc_url: &str,
 ) -> Result<String> {

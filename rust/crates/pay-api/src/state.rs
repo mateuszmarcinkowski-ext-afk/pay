@@ -143,7 +143,7 @@ async fn build_confidential_workers(
 fn spawn_confidential_workers(
     config: &Config,
     coin: &Stablecoin,
-    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
+    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>,
     fee_payer_pubkey: String,
 ) -> HashMap<Network, ConfidentialHandle> {
     let mut handles = HashMap::with_capacity(config.networks.len());

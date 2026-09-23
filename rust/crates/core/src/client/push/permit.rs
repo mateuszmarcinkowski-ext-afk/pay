@@ -13,7 +13,6 @@ use std::collections::HashMap;
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use pay_kit::mpp::solana_keychain::{MemorySigner, SolanaSigner};
 use solana_hash::Hash;
 use solana_message::Message;
 use solana_pubkey::Pubkey;
@@ -188,7 +187,7 @@ pub struct BatchSigningPermit {
     max_transactions: usize,
     expires_at: DateTime<Utc>,
 
-    signer: MemorySigner,
+    signer: crate::signer::LoadedSigner,
     runtime: tokio::runtime::Runtime,
 
     signed_amount_raw: u64,
@@ -464,11 +463,15 @@ impl BatchSigningPermit {
         prepared_transaction: &Transaction,
     ) -> Result<(Signature, Hash, String)> {
         let mut tx = prepared_transaction.clone();
+        // TransactionSigner (keychain 2.x) signs a VersionedTransaction; the
+        // legacy round-trip is lossless, so copy the signatures back.
+        let mut versioned = solana_transaction::versioned::VersionedTransaction::from(tx.clone());
         let result = self
             .runtime
-            .block_on(self.signer.sign_transaction(&mut tx))
+            .block_on(self.signer.sign_transaction(&mut versioned))
             .map_err(|e| Error::Config(format!("failed to sign prepared transaction: {e}")))?;
         let (_, signature) = result.into_signed_transaction();
+        tx.signatures = versioned.signatures;
         let blockhash = tx.message.recent_blockhash;
         let bytes = bincode::serialize(&tx)
             .map_err(|e| Error::Config(format!("failed to serialize signed transaction: {e}")))?;
@@ -867,6 +870,7 @@ mod tests {
             vault: None,
             account: None,
             path: None,
+            derivation_path: None,
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-08-12T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),

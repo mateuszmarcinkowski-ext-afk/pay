@@ -228,6 +228,8 @@ fn keystore_for_kind(
         // no external keystore to delete from. The earlier `accounts.remove`
         // call already wiped the entry, so we just no-op here.
         KeystoreKind::Ephemeral => Ok(None),
+        // Ledger: the key never left the device; nothing to delete.
+        KeystoreKind::Ledger => Ok(None),
     }
 }
 
@@ -246,6 +248,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 vault: None,
                 account: None,
                 path: None,
+                derivation_path: None,
                 secret_key_b58: None,
                 created_at: None,
                 subscriptions: std::collections::BTreeMap::new(),
@@ -266,6 +269,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 vault: None,
                 account: None,
                 path: None,
+                derivation_path: None,
                 secret_key_b58: None,
                 created_at: None,
                 subscriptions: std::collections::BTreeMap::new(),
@@ -285,6 +289,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 vault: None,
                 account: None,
                 path: None,
+                derivation_path: None,
                 secret_key_b58: None,
                 created_at: None,
                 subscriptions: std::collections::BTreeMap::new(),

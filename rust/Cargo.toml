@@ -113,7 +113,7 @@ same-file = "1.0"
 # deps. The `axum` feature (kit's own gate) is intentionally OFF — pay has its
 # own gate (pay-core + pay-proxy).
 #
-pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit.git", rev = "39d7978f6a0e96680e65a0bc11a750419829fac5", default-features = false, features = [
+pay-kit = { package = "solana-pay-kit", git = "https://github.com/ledgicr/pay-kit.git", rev = "e8c811346412c6eebfb47dc5e7bad88a2b05cd85", default-features = false, features = [
     "mpp",
     "x402",
     "client",
@@ -135,3 +135,10 @@ solana-sanitize = "3.0"
 solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "3.1"
+
+# Ledger demo: solana-keychain 2.x with the Ledger backend lives only on the
+# PR branch (solana-foundation/solana-keychain#301); crates.io has 2.0.0-beta.1
+# without it. todo: drop once #301 is released.
+[patch.crates-io]
+solana-keychain = { git = "https://github.com/ledgicr/solana-keychain.git", rev = "4e37f6a90b3259be6676d2abac8f235d7b59a6ca" }
+solana-remote-wallet = { path = "../vendor/solana-remote-wallet" } # agave#15100, unreleased (4.0.3: other solana-* pins cap it below 4.2)

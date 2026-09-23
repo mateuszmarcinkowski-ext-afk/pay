@@ -94,7 +94,7 @@ use pay_api_types::transfer_batch::{
     TransferBatchRequest, TransferBatchResponse, TransferBatchStatus, TransferNetwork,
 };
 use pay_kit::mpp::protocol::solana::programs;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -379,7 +379,7 @@ fn parse_positive_base_units(amount: &str, decimals: u8) -> Option<u64> {
 /// key material directly, only the [`SolanaSigner`] trait object.
 pub struct TransferBatchSponsor {
     pub fee_payer_pubkey: Pubkey,
-    pub signer: Arc<dyn SolanaSigner>,
+    pub signer: Arc<dyn TransactionSigner>,
 }
 
 /// Operator-configured pricing and transaction-shape ceilings. See the
@@ -547,12 +547,16 @@ pub async fn submit(
         return Err(TransferBatchError::FeePayerSlotAlreadySigned);
     }
 
+    // TransactionSigner signs a VersionedTransaction; the legacy round-trip is
+    // lossless, so copy the signatures back onto the legacy tx we serialize.
+    let mut versioned = solana_transaction::versioned::VersionedTransaction::from(tx.clone());
     runtime
         .sponsor
         .signer
-        .sign_transaction(&mut tx)
+        .sign_transaction(&mut versioned)
         .await
         .map_err(|e| TransferBatchError::SigningFailed(e.to_string()))?;
+    tx.signatures = versioned.signatures;
 
     let signed_bytes =
         bincode::serialize(&tx).map_err(|e| TransferBatchError::SigningFailed(e.to_string()))?;

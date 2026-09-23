@@ -105,6 +105,7 @@ impl SetupCommand {
             Some(&backend),
             self.vault.as_deref(),
             self.force,
+            None,
         )?;
         super::buzz_setup::maybe_configure();
 
@@ -157,6 +158,7 @@ impl SetupCommand {
                 self.backend.as_deref(),
                 self.vault.as_deref(),
                 self.force,
+                None,
             )?;
             (pk, false)
         };

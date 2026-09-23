@@ -12,7 +12,7 @@ use pay_core::accounts::AccountsStore;
 use pay_core::server::session::{SessionLifecycleReconciliation, SessionMpp};
 use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_types::Stablecoin;
 use pay_types::metering::{
     ApiSpec, OperatorConfig, RoutingConfig, SessionBenchmarkTestMint, SignerConfig,
@@ -175,7 +175,7 @@ struct AppState {
     session_mpps: Vec<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     x402: Option<pay_kit::x402::server::X402>,
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
     pdb: Option<pay_pdb::PdbState>,
@@ -209,7 +209,7 @@ impl PaymentState for AppState {
     fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
         self.fee_payer_wallet.as_ref()
     }
-    fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
+    fn fee_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
         self.fee_payer_signer.clone()
     }
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
@@ -886,7 +886,7 @@ impl StartCommand {
             //   4. **None** — leaves fee_payer_signer empty. Caught by
             //      the early-validation guard below if `fee_payer: true`.
             let mut generated_gateway_account: Option<(String, String)> = None;
-            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if should_use_auto_fee_payer_signer(
+            let fee_payer_signer: Option<Arc<dyn TransactionSigner>> = if should_use_auto_fee_payer_signer(
                 sandbox,
                 &network,
                 signer_cfg.as_ref(),
@@ -912,7 +912,7 @@ impl StartCommand {
                 // tells the user *why* it's being asked. The same
                 // signer is then used as both the fee-payer and the
                 // recipient-pubkey source (no second load).
-                Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
+                Some(signer)
             } else {
                 None
             };
@@ -2162,7 +2162,7 @@ async fn ensure_subscription_plans(
     mut api: ApiSpec,
     spec_path: &str,
     operator_pubkey_str: &str,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     rpc_url: &str,
 ) -> pay_core::Result<ApiSpec> {
     use dialoguer::Confirm;
@@ -2532,7 +2532,7 @@ fn resolve_operator_currencies(op: Option<&OperatorConfig>, cli_currency: &str) 
 ///
 /// Must be called from within the main async runtime so the GCP auth
 /// token cache's background refresh tasks stay alive.
-async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn SolanaSigner>> {
+async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn TransactionSigner>> {
     let store = pay_core::accounts::FileAccountsStore::default_path();
     resolve_signer_with_store(config, &store).await
 }
@@ -2546,7 +2546,7 @@ async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn Solan
 async fn resolve_signer_with_store(
     config: &SignerConfig,
     store: &dyn AccountsStore,
-) -> pay_core::Result<Arc<dyn SolanaSigner>> {
+) -> pay_core::Result<Arc<dyn TransactionSigner>> {
     match config {
         #[cfg(feature = "gcp_kms")]
         SignerConfig::GcpKms { key_name, pubkey } => {
@@ -2600,16 +2600,18 @@ async fn resolve_signer_with_store(
                         "Account `{name}` is ephemeral but has no inline secret_key_b58"
                     ))
                 })?;
-                pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(|e| {
-                    pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
-                })?
+                let memory = pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes)
+                    .map_err(|e| {
+                        pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
+                    })?;
+                Arc::new(memory) as pay_core::signer::LoadedSigner
             } else {
                 let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
                 pay_core::signer::load_signer_from_account_with_intent(
                     account, name, network, &intent,
                 )?
             };
-            Ok(Arc::new(signer))
+            Ok(signer)
         }
         SignerConfig::File { path } => {
             let expanded = shellexpand::tilde(path).into_owned();
@@ -2623,7 +2625,7 @@ async fn resolve_signer_with_store(
                      Generate one with `solana-keygen new -o {path}`."
                     ))
                 })?;
-            Ok(Arc::new(signer))
+            Ok(signer)
         }
         SignerConfig::Env { value_from_env } => {
             let signer = load_env_keypair_signer(value_from_env)?;
@@ -3936,6 +3938,7 @@ endpoints:
             vault: None,
             account: None,
             path: None,
+            derivation_path: None,
             secret_key_b58: Some(bs58::encode(&VALID_TEST_KEYPAIR_BYTES[..]).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
@@ -4116,6 +4119,7 @@ endpoints:
             account: None,
             path: None,
             // Valid base58 but wrong length (decodes to <64 bytes).
+            derivation_path: None,
             secret_key_b58: Some("abc".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),

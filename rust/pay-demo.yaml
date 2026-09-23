@@ -1,0 +1,51 @@
+name: payment-debugger
+subdomain: payment-debugger
+title: "Payment Debugger"
+description: "Compact demo API for inspecting paid requests and one payout split."
+category: ai_ml
+version: v1
+routing:
+  type: respond
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: "localnet"
+  fee_payer: true
+
+recipients:
+  vendor:
+    account: "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu"
+    label: "Vendor"
+
+endpoints:
+  - method: GET
+    path: "health"
+    description: "Health check."
+
+  - method: GET
+    path: "api/v1/reports/usage"
+    resource: "reports"
+    description: "Usage report."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+
+  - method: POST
+    path: "api/v1/orders/checkout"
+    resource: "orders"
+    description: "Checkout with a vendor payout split."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 1.00
+      splits:
+        - recipient: vendor
+          percent: 10
+          memo: "Vendor payout"

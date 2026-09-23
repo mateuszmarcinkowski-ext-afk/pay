@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use pay_api_core::Error;
-use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner};
+use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner, TransactionSigner};
 
 use crate::config::FeePayerConfig;
 
@@ -31,7 +31,7 @@ pub async fn build_fee_payer_signer(
     fee_payer: &FeePayerConfig,
     missing_key_name_msg: &str,
     missing_pubkey_msg: &str,
-) -> Result<Arc<dyn SolanaSigner>, Error> {
+) -> Result<Arc<dyn TransactionSigner>, Error> {
     if let Ok(key) = std::env::var(LOCAL_PRIVATE_KEY_ENV) {
         let key = key.trim();
         if !key.is_empty() {

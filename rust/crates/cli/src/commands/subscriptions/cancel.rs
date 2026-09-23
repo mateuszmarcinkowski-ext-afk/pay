@@ -20,7 +20,6 @@
 //! on-chain operation. Both paths converge on flipping the local
 //! accounts.yml entry to `cancelled` after settlement.
 
-use std::sync::Arc;
 
 use owo_colors::OwoColorize;
 use pay_kit::mpp::client::build_credential_header;
@@ -28,7 +27,7 @@ use pay_kit::mpp::program::subscriptions::{
     CancelSubscriptionAccounts, build_cancel_subscription_ix, default_program_id,
     find_event_authority_pda, parse_pubkey,
 };
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::mpp::{PaymentChallenge, parse_www_authenticate};
 use solana_message::Message;
@@ -276,7 +275,7 @@ impl CancelCommand {
                 },
             );
             rt.block_on(broadcast_via_gateway(
-                Arc::new(signer),
+                signer,
                 ix,
                 &gw_fee_payer,
                 &gateway_url,
@@ -295,7 +294,7 @@ impl CancelCommand {
                     event_authority,
                 },
             );
-            rt.block_on(broadcast_direct(&signer, ix, &rpc_url))
+            rt.block_on(broadcast_direct(signer.as_ref(), ix, &rpc_url))
                 .map_err(|e| pay_core::Error::Mpp(format!("Direct cancel broadcast failed: {e}")))?
         };
 
@@ -343,7 +342,7 @@ impl CancelCommand {
 // ── Direct on-chain path ────────────────────────────────────────────────────
 
 async fn broadcast_direct(
-    signer: &dyn SolanaSigner,
+    signer: &dyn TransactionSigner,
     instruction: solana_instruction::Instruction,
     rpc_url: &str,
 ) -> pay_core::Result<String> {
@@ -400,7 +399,7 @@ async fn broadcast_direct(
 
 #[allow(clippy::too_many_arguments)]
 async fn broadcast_via_gateway(
-    signer: Arc<pay_kit::mpp::solana_keychain::MemorySigner>,
+    signer: pay_core::signer::LoadedSigner,
     instruction: solana_instruction::Instruction,
     gateway_fee_payer: &Pubkey,
     gateway_url: &str,

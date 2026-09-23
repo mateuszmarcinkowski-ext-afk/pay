@@ -7,7 +7,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
@@ -88,7 +88,7 @@ pub struct RegistrationOutcome {
 /// idempotent. A conflicting existing entry must be deregistered explicitly.
 pub async fn register_service(
     registration: &ServiceRegistration,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     rpc_url: &str,
 ) -> pay_core::Result<RegistrationOutcome> {
     let program_id = program_id()?;
@@ -171,7 +171,7 @@ pub async fn register_service(
 /// grace period eventually makes the entry eligible for rewarded eviction.
 pub fn spawn_renewal_task(
     registration: ServiceRegistration,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     rpc_url: String,
 ) {
     tokio::spawn(async move {
@@ -325,7 +325,7 @@ fn validate_field(name: &str, value: &str, max_len: usize, required: bool) -> pa
 }
 
 async fn sign_simulate_and_broadcast(
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     instruction: Instruction,
     rpc_url: &str,
 ) -> pay_core::Result<String> {

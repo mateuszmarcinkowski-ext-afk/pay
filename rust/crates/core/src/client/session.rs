@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use pay_kit::mpp::client::session::ActiveSession;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_kit::mpp::{
     ClosePayload, PaymentChallenge, PaymentCredential, SessionAction, SessionAuthentication,
     SessionAuthenticationType, SessionRequest, SessionVoucherSigner, SignedVoucher, UsePayload,
@@ -76,7 +76,7 @@ impl SessionHandle {
     /// `authorized_signer` in the open transaction.
     pub fn new(
         channel_id: Pubkey,
-        signer: Box<dyn SolanaSigner>,
+        signer: Box<dyn TransactionSigner>,
         challenge: PaymentChallenge,
     ) -> Self {
         Self::from_active(ActiveSession::new(channel_id, signer), challenge)
@@ -350,7 +350,7 @@ pub fn open_payment_channel_session_header_with_override(
     let mut kp_bytes = [0u8; 64];
     kp_bytes[..32].copy_from_slice(sk.as_bytes());
     kp_bytes[32..].copy_from_slice(vk.as_bytes());
-    let session_signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
+    let session_signer: Box<dyn pay_kit::mpp::solana_keychain::TransactionSigner> =
         Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
 
     let voucher_signer = details
@@ -413,7 +413,7 @@ pub fn open_payment_channel_session_header_with_override(
     let opened = rt
         .block_on(create_payment_channel_session_opener(
             request,
-            &signer,
+            signer.as_ref(),
             session_signer,
             None,
             PaymentChannelSessionOpenOptions {
@@ -640,7 +640,7 @@ mod tests {
         )
     }
 
-    fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn SolanaSigner>) {
+    fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn TransactionSigner>) {
         use ed25519_dalek::SigningKey;
         use pay_kit::mpp::solana_keychain::MemorySigner;
 
@@ -652,7 +652,7 @@ mod tests {
         (sk.clone(), Box::new(MemorySigner::from_bytes(&kp).unwrap()))
     }
 
-    fn test_signer() -> Box<dyn SolanaSigner> {
+    fn test_signer() -> Box<dyn TransactionSigner> {
         test_keypair().1
     }
 

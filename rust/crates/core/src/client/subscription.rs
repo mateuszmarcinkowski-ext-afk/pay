@@ -22,7 +22,7 @@ use pay_kit::mpp::protocol::core::PaymentCredential;
 use pay_kit::mpp::protocol::intents::{
     SubscriptionPeriodUnit, SubscriptionReceiptExtensions, SubscriptionRequest,
 };
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 use tracing::{info, warn};
 
@@ -339,7 +339,7 @@ pub fn build_credential_with_authenticate_and_override(
 
     let payload = rt
         .block_on(build_subscription_activation_transaction_with_options(
-            &signer,
+            signer.as_ref(),
             &rpc,
             &decoded.method_details,
             BuildSubscriptionActivationOptions {
@@ -363,7 +363,7 @@ pub fn build_credential_with_authenticate_and_override(
     // re-prompt later, and so the persistence step can cache the token
     // in the same row as the freshly-activated subscription.
     let (authenticate_token, authenticate_expires_at) = match authenticate_challenge {
-        Some(auth) => match sign_authenticate(&rt, &signer, auth, &decoded.method_details) {
+        Some(auth) => match sign_authenticate(&rt, signer.as_ref(), auth, &decoded.method_details) {
             Ok((header, expiry)) => (Some(header), Some(expiry)),
             Err(e) => {
                 warn!(
@@ -395,7 +395,7 @@ pub fn build_credential_with_authenticate_and_override(
 /// activation tx used. Returns (Authorization header, expires_at).
 fn sign_authenticate(
     rt: &tokio::runtime::Runtime,
-    signer: &dyn SolanaSigner,
+    signer: &dyn TransactionSigner,
     challenge: &Challenge,
     method_details: &SubscriptionMethodDetails,
 ) -> Result<(String, String)> {

@@ -24,7 +24,7 @@ use pay_api_core::Error;
 use pay_api_core::ata::{ATA_PROGRAM_ID, associated_token_address};
 use pay_api_core::receipt::MEMO_PROGRAM;
 use pay_api_types::Network;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::{SolanaSigner, TransactionSigner};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_instruction::{AccountMeta, Instruction};
@@ -504,7 +504,7 @@ fn build_unsigned(
 /// Sign and serialize the transaction without contacting the RPC.
 async fn sign_transaction(
     mut tx: Transaction,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
 ) -> Result<String, String> {
     let fee_payer = signer.pubkey();
     let idx = tx
@@ -558,7 +558,7 @@ fn is_deterministic_preflight_error(error: &Error) -> bool {
     .any(|marker| message.contains(marker))
 }
 
-async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn SolanaSigner>, Error> {
+async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn TransactionSigner>, Error> {
     crate::signer::build_fee_payer_signer(
         &state.send.fee_payer,
         "send.fee_payer.key_name is missing",
