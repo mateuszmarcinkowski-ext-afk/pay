@@ -967,7 +967,9 @@ pub(crate) fn sign_in_chain(
         &challenge.extension,
         &SiwxChainSelectionOptions {
             preferred_chain_id,
-            supported_chain_ids: vec![],
+            // Without a forced network, sign in on mainnet like payments do, else the
+            // first Solana chain offered.
+            supported_chain_ids: vec![SOLANA_MAINNET.to_string()],
         },
     )
     .map_err(|e| Error::Mpp(format!("Failed to select x402 sign-in challenge: {e}")))?;
@@ -1771,6 +1773,42 @@ mod tests {
         assert_eq!(payload.address, pubkey);
         assert_eq!(payload.chain_id, SOLANA_DEVNET);
         assert!(pay_kit::x402::siwx::verify_siwx_payload(&payload).unwrap());
+    }
+
+    #[test]
+    fn sign_in_chain_prefers_mainnet_unless_a_network_is_forced() {
+        let challenge_on = |chains: &[&str]| SiwxAuthChallenge {
+            extension: pay_kit::x402::siwx::SiwxExtension::new(
+                pay_kit::x402::siwx::SiwxExtensionInfo {
+                    domain: "api.example.com".to_string(),
+                    uri: "https://api.example.com".to_string(),
+                    statement: Some("Sign in.".to_string()),
+                    version: "1".to_string(),
+                    nonce: "nonce-123".to_string(),
+                    issued_at: "2026-04-27T00:00:00Z".to_string(),
+                    expiration_time: None,
+                    not_before: None,
+                    request_id: None,
+                    resources: None,
+                },
+                chains
+                    .iter()
+                    .map(|chain| pay_kit::x402::siwx::SupportedChain::solana(*chain))
+                    .collect(),
+            ),
+        };
+        let both = challenge_on(&[SOLANA_DEVNET, SOLANA_MAINNET]);
+
+        let (chain, network) = sign_in_chain(&both, None).unwrap();
+        assert_eq!(network, "mainnet");
+        assert_eq!(chain.chain_id, SOLANA_MAINNET);
+
+        let (chain, network) = sign_in_chain(&both, Some("devnet")).unwrap();
+        assert_eq!(network, "devnet");
+        assert_eq!(chain.chain_id, SOLANA_DEVNET);
+
+        let (_, network) = sign_in_chain(&challenge_on(&[SOLANA_DEVNET]), None).unwrap();
+        assert_eq!(network, "devnet");
     }
 
     #[test]
