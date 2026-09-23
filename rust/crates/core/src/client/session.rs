@@ -538,6 +538,85 @@ pub fn open_operator_signed_session_authorizations(
     Ok((open_authorization, use_authorization))
 }
 
+/// Only client-signed sessions work with a hardware wallet: the operator-signed
+/// payer proof is a raw-message signature the device cannot produce.
+pub fn challenge_is_client_signed(challenge: &PaymentChallenge) -> Result<bool> {
+    let request: SessionRequest = challenge
+        .request
+        .decode()
+        .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+    Ok(request
+        .method_details
+        .voucher_signer
+        .unwrap_or(SessionVoucherSigner::Client)
+        == SessionVoucherSigner::Client)
+}
+
+/// Returns the handle, the `open` `Authorization` header and the unit price.
+///
+/// The caller keeps the handle and signs a voucher from it per request. The
+/// `authorized_signer` is an in-process ephemeral key, so a hardware wallet
+/// signs only the `open` transaction.
+pub fn open_client_signed_session(
+    challenge: &PaymentChallenge,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: &str,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<(SessionHandle, String, u64)> {
+    let request: SessionRequest = challenge
+        .request
+        .decode()
+        .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+    if request.method_details.voucher_signer == Some(SessionVoucherSigner::Operator) {
+        return Err(Error::Mpp(
+            "this challenge asks for an operator-signed MPP session".to_string(),
+        ));
+    }
+    if let Some(forced) = network_override
+        && forced != request.method_details.network
+    {
+        return Err(Error::Mpp(format!(
+            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
+            request.method_details.network
+        )));
+    }
+    let unit_price = request.amount.parse::<u64>().map_err(|_| {
+        Error::Mpp(format!(
+            "session challenge carried a non-numeric unit price: {}",
+            request.amount
+        ))
+    })?;
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(0);
+    let deposit = request
+        .suggested_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1);
+    let sandbox = network_override == Some("localnet");
+    let (handle, open_authorization) = open_payment_channel_session_header_with_override(
+        challenge,
+        &request,
+        store,
+        network_override,
+        account_override,
+        deposit,
+        resource_url,
+        sandbox,
+        auth_override,
+    )?;
+    Ok((handle, open_authorization, unit_price))
+}
+
 fn parse_session_deposit(value: &str) -> Result<u64> {
     value.parse::<u64>().map_err(|_| {
         Error::Mpp(format!(

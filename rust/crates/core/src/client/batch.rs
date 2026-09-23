@@ -49,10 +49,19 @@ fn cache_key(requirements: &BatchRequirements) -> String {
     )
 }
 
+/// `voucher_key` is set when a hardware wallet (no raw-message signing) funded the
+/// channel; it is the `payerAuthorizer`, a PDA seed bound at `open`, so it must
+/// live as long as the channel.
+#[derive(Clone)]
+pub struct CachedChannel {
+    pub channel: BatchChannel,
+    pub voucher_key: Option<ed25519_dalek::SigningKey>,
+}
+
 /// Process-lifetime cache of open `batch-settlement` channels.
 #[derive(Clone, Default)]
 pub struct BatchChannelCache {
-    channels: Arc<Mutex<HashMap<String, BatchChannel>>>,
+    channels: Arc<Mutex<HashMap<String, CachedChannel>>>,
 }
 
 impl BatchChannelCache {
@@ -61,15 +70,15 @@ impl BatchChannelCache {
     }
 
     /// The channel already open for this offer, if any.
-    pub fn get(&self, requirements: &BatchRequirements) -> Result<Option<BatchChannel>> {
+    pub fn get(&self, requirements: &BatchRequirements) -> Result<Option<CachedChannel>> {
         let channels = self.lock()?;
         Ok(channels.get(&cache_key(requirements)).cloned())
     }
 
     /// Remember a channel opened for this offer.
-    pub fn insert(&self, requirements: &BatchRequirements, channel: BatchChannel) -> Result<()> {
+    pub fn insert(&self, requirements: &BatchRequirements, entry: CachedChannel) -> Result<()> {
         let mut channels = self.lock()?;
-        channels.insert(cache_key(requirements), channel);
+        channels.insert(cache_key(requirements), entry);
         Ok(())
     }
 
@@ -96,13 +105,14 @@ impl BatchChannelCache {
     ) -> Result<u64> {
         let mut channels = self.lock()?;
         let key = cache_key(requirements);
-        let channel = channels.get_mut(&key).ok_or_else(|| {
+        let entry = channels.get_mut(&key).ok_or_else(|| {
             Error::Mpp("no cached batch-settlement channel for this offer".to_string())
         })?;
-        channel
+        entry
+            .channel
             .apply_payment_response(response, requirements, submitted)
             .map_err(|e| Error::Mpp(format!("batch-settlement settlement rejected: {e}")))?;
-        Ok(channel.charged_cumulative_amount())
+        Ok(entry.channel.charged_cumulative_amount())
     }
 
     /// Resynchronize from a corrective 402.
@@ -114,10 +124,10 @@ impl BatchChannelCache {
     pub fn adopt_corrective(&self, requirements: &BatchRequirements) -> Result<Option<u64>> {
         let mut channels = self.lock()?;
         let key = cache_key(requirements);
-        let Some(channel) = channels.get_mut(&key) else {
+        let Some(entry) = channels.get_mut(&key) else {
             return Ok(None);
         };
-        match channel.adopt_corrective_state(requirements) {
+        match entry.channel.adopt_corrective_state(requirements) {
             Ok(cumulative) => Ok(Some(cumulative)),
             Err(e) => {
                 // Unverifiable: the safe move is to forget the channel rather
@@ -150,7 +160,7 @@ impl BatchChannelCache {
             .map(Some)
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, BatchChannel>>> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, CachedChannel>>> {
         self.channels
             .lock()
             .map_err(|_| Error::Mpp("batch-settlement channel cache lock poisoned".to_string()))

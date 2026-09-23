@@ -1890,7 +1890,7 @@ fn pay_session_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (_handle, auth_header) = pay_core::session::open_payment_channel_session_header(
+    let (handle, auth_header) = pay_core::session::open_payment_channel_session_header(
         challenge,
         request,
         &store,
@@ -1904,7 +1904,27 @@ fn pay_session_and_retry(
     let receipt_network = network_override
         .map(str::to_string)
         .or_else(|| mpp_challenge_network(challenge));
-    let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
+    let retry_outcome =
+        retry_with_header(tool, "Authorization", &auth_header, fetch_headers.clone())?;
+
+    // `open` only registers the channel; the server answers 402 until a voucher arrives.
+    let retry_outcome = match retry_outcome {
+        RunOutcome::SessionChallenge { .. } | RunOutcome::UnknownPaymentRequired { .. } => {
+            let unit_price: u64 = request.amount.parse().map_err(|_| {
+                pay_core::Error::Mpp(format!(
+                    "session challenge carried a non-numeric unit price: {}",
+                    request.amount
+                ))
+            })?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| pay_core::Error::Config(format!("Failed to create runtime: {e}")))?;
+            let voucher_header = rt.block_on(handle.voucher_header(unit_price))?;
+            retry_with_header(tool, "Authorization", &voucher_header, fetch_headers)?
+        }
+        settled => settled,
+    };
     handle_retry_outcome(
         retry_outcome,
         is_json,
