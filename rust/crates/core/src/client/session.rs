@@ -1016,4 +1016,102 @@ mod tests {
             _ => panic!("expected voucher action"),
         }
     }
+
+    /// The first MPP session challenge the Alibaba translate gateway sent
+    /// (recorded 2026-09-24): client-signed, mainnet, USDC.
+    fn recorded_alibaba_session_challenge() -> PaymentChallenge {
+        let header = include_str!(
+            "../../tests/fixtures/pay-sh/alibaba-translate-gateway402.402-headers.txt"
+        )
+        .lines()
+        .find_map(|line| line.strip_prefix("www-authenticate: "))
+        .expect("the fixture carries an MPP challenge");
+        SessionHandle::parse_challenge(header)
+            .expect("the fixture's first challenge is a session")
+            .0
+    }
+
+    #[test]
+    fn client_signed_open_delegates_the_voucher_key_without_making_it_a_signer() {
+        use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
+
+        let challenge = recorded_alibaba_session_challenge();
+        assert!(challenge_is_client_signed(&challenge).unwrap());
+        let payer_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(payer_key.as_bytes());
+        keypair[32..].copy_from_slice(payer_key.verifying_key().as_bytes());
+        let payer = bs58::encode(payer_key.verifying_key().as_bytes()).into_string();
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some(payer.clone()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(keypair).into_string()),
+                created_at: None,
+                subscriptions: std::collections::BTreeMap::new(),
+            },
+        );
+        let store = MemoryAccountsStore::with_file(file);
+
+        // The recorded challenge carries its blockhash and slot, so the open
+        // is built without an RPC round trip.
+        let (handle, open_header, unit_price, deposit) = open_client_signed_session(
+            &challenge,
+            &store,
+            None,
+            None,
+            "https://gateway402.example/compatible-mode/v1/chat/completions",
+            None,
+        )
+        .unwrap();
+        assert_eq!(unit_price, 2);
+        assert_eq!(deposit, 100_000);
+
+        let SessionAction::Open(open) = parse_action(&open_header) else {
+            panic!("the first header must open the channel");
+        };
+        assert_eq!(open.payer, payer);
+        assert_eq!(open.deposit_amount, "100000");
+        assert!(open.authentication.is_none());
+        assert_ne!(
+            open.authorized_signer, payer,
+            "vouchers must be signed by a delegated key, not the payer"
+        );
+
+        let tx = pay_kit::core::tx::decode(&open.transaction).unwrap();
+        let signers = usize::from(tx.message.header().num_required_signatures);
+        let keys = tx.message.static_account_keys();
+        let payer_pubkey: Pubkey = payer.parse().unwrap();
+        let delegate: Pubkey = open.authorized_signer.parse().unwrap();
+        assert!(
+            keys[..signers].contains(&payer_pubkey),
+            "the payer must sign the open"
+        );
+        let position = keys
+            .iter()
+            .position(|key| *key == delegate)
+            .expect("the delegated key must be an account of the open");
+        assert!(
+            position >= signers,
+            "the delegated key must never be a required signer, found at index {position}"
+        );
+
+        // The delegated key is the one the handle signs vouchers with.
+        let SessionAction::Voucher(voucher) =
+            parse_action(&voucher_header_sync(&handle, 2).unwrap())
+        else {
+            panic!("expected a voucher action");
+        };
+        assert_eq!(voucher.voucher.signer, open.authorized_signer);
+        assert_eq!(voucher.voucher.data.cumulative_amount, "2");
+    }
 }
