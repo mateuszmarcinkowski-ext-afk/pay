@@ -340,6 +340,20 @@ pub fn backend_for_network(
     }
 }
 
+/// Whether accounts.yml names an account for `network`; a throwaway wallet
+/// created at payment time does not count.
+pub(crate) fn has_configured_account(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+) -> Result<bool> {
+    let file = store.load()?;
+    Ok(matches!(
+        select_account(&file, network, account_override),
+        Ok(AccountSelection::Configured { .. })
+    ))
+}
+
 /// Whether the configured signer can produce raw message signatures.
 ///
 /// Returning only a boolean keeps account-derived configuration data out of

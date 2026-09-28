@@ -660,7 +660,7 @@ impl RunOutcome {
                     .unwrap_or(request.method_details.network)
             }
             RunOutcome::X402SignInChallenge { challenge, .. } => {
-                match x402::sign_in_chain(challenge, network_override) {
+                match x402::sign_in_chain(challenge, store, network_override, account_override) {
                     Ok((_, network)) => network,
                     Err(_) => return Ok(None),
                 }
@@ -2403,6 +2403,27 @@ HTTP request sent, awaiting response...
         let outcome = outcome.for_signer_support(support);
         assert!(
             matches!(outcome, RunOutcome::X402Challenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn configured_signer_signs_in_on_devnet_without_a_mainnet_account() {
+        // Nothing configured: the sign-in answers on the first chain offered,
+        // where a throwaway devnet wallet can sign it.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let headers = siwx_with_payment_402_on(&[
+            pay_kit::x402::exact::SOLANA_DEVNET,
+            pay_kit::x402::exact::SOLANA_MAINNET,
+        ]);
+        let outcome = classify_402(&headers, None, "https://e.com/r");
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        assert_eq!(support, None);
+        let outcome = outcome.for_signer_support(support);
+        assert!(
+            matches!(outcome, RunOutcome::X402SignInChallenge { .. }),
             "{outcome:?}"
         );
     }
