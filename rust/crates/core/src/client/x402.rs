@@ -609,6 +609,21 @@ pub fn build_batch_payment(
         });
     }
 
+    let refuse_abandoned = || -> Result<()> {
+        if cache.is_abandoned(requirements)? {
+            return Err(Error::Mpp(
+                "this seller dropped a funded batch-settlement channel in this session; \
+                 refusing to escrow another deposit. Restart pay to retry."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    };
+    // Before the signer loads: resolving a hardware wallet prompts on the device.
+    if payer.is_some() && existing.is_none() {
+        refuse_abandoned()?;
+    }
+
     let authorization_amount = escrow_amount.unwrap_or(price).to_string();
     let ChannelPaymentSetup {
         signer,
@@ -645,6 +660,9 @@ pub fn build_batch_payment(
     let (existing, escrow_amount) = match existing {
         None if payer.is_none() => {
             let existing = cache.get(requirements, &signer_pubkey)?;
+            if existing.is_none() {
+                refuse_abandoned()?;
+            }
             let escrow_amount = escrow_for(existing.as_ref());
             (existing, escrow_amount)
         }
@@ -2331,6 +2349,95 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    /// Rebuild the cached channel as if the server had confirmed its first
+    /// voucher, which is what makes a dropped channel a funded one.
+    fn confirm_first_voucher(
+        cache: &crate::client::batch::BatchChannelCache,
+        requirements: &pay_kit::x402::batch_settlement::BatchRequirements,
+    ) {
+        let payer = signer_from_seed(7).pubkey().to_string();
+        let entry = cache.get(requirements, &payer).unwrap().unwrap();
+        let channel = pay_kit::x402::client::batch_settlement::BatchChannel::new(
+            *entry.channel.channel_id(),
+            entry.channel.config().clone(),
+            1_000,
+            entry.channel.deposit(),
+        );
+        cache
+            .insert(
+                requirements,
+                crate::client::batch::CachedChannel {
+                    channel,
+                    voucher_key: entry.voucher_key,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn batch_payment_refuses_an_abandoned_seller_before_loading_the_signer() {
+        let (challenge, store, cache) = cached_batch_channel(Some(7), true);
+        confirm_first_voucher(&cache, &challenge.requirements);
+        let payer = signer_from_seed(7).pubkey().to_string();
+        assert!(
+            cache
+                .adopt_corrective(&challenge.requirements, &payer)
+                .is_err()
+        );
+
+        // `b` records a pubkey but has no secret, so loading its signer fails:
+        // a hardware wallet would already have prompted by then.
+        let err = build_batch_payment(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            Some("b"),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("refusing to escrow another deposit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn batch_payment_refuses_to_reopen_for_an_abandoned_seller() {
+        let (challenge, store, cache) = cached_batch_channel(Some(7), true);
+        confirm_first_voucher(&cache, &challenge.requirements);
+        let payer = signer_from_seed(7).pubkey().to_string();
+        // No channelState: the corrective is unverifiable and the funded channel
+        // is dropped.
+        assert!(
+            cache
+                .adopt_corrective(&challenge.requirements, &payer)
+                .is_err()
+        );
+
+        let err = build_batch_payment(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("refusing to escrow another deposit"),
+            "{err}"
+        );
     }
 
     #[test]

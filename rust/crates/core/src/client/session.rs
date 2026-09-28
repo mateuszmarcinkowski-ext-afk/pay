@@ -552,7 +552,8 @@ pub fn challenge_is_client_signed(challenge: &PaymentChallenge) -> Result<bool> 
         == SessionVoucherSigner::Client)
 }
 
-/// Returns the handle, the `open` `Authorization` header and the unit price.
+/// Returns the handle, the `open` `Authorization` header, the unit price and
+/// the deposit the `open` escrows.
 ///
 /// The caller keeps the handle and signs a voucher from it per request. The
 /// `authorized_signer` is an in-process ephemeral key, so a hardware wallet
@@ -564,7 +565,7 @@ pub fn open_client_signed_session(
     account_override: Option<&str>,
     resource_url: &str,
     auth_override: crate::signer::AuthOverride,
-) -> Result<(SessionHandle, String, u64)> {
+) -> Result<(SessionHandle, String, u64, u64)> {
     let request: SessionRequest = challenge
         .request
         .decode()
@@ -614,7 +615,7 @@ pub fn open_client_signed_session(
         sandbox,
         auth_override,
     )?;
-    Ok((handle, open_authorization, unit_price))
+    Ok((handle, open_authorization, unit_price, deposit))
 }
 
 fn parse_session_deposit(value: &str) -> Result<u64> {
@@ -632,6 +633,15 @@ pub fn voucher_header_sync(handle: &SessionHandle, amount: u64) -> Result<String
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to build runtime: {e}")))?;
     rt.block_on(handle.voucher_header(amount))
+}
+
+/// The cumulative amount a session has authorized so far (base units).
+pub fn cumulative_sync(handle: &SessionHandle) -> Result<u64> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to build runtime: {e}")))?;
+    Ok(rt.block_on(handle.cumulative()))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
