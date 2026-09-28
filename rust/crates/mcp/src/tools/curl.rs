@@ -1159,7 +1159,7 @@ fn do_paid_fetch(
                 && corrective.error.is_some()
                 && session_cache
                     .batch_channels
-                    .adopt_corrective(&corrective.requirements)
+                    .adopt_corrective(&corrective.requirements, &built.payer)
                     .is_ok_and(|adopted| adopted.is_some())
             {
                 let retry = pay_core::client::x402::build_batch_payment(
@@ -1184,6 +1184,7 @@ fn do_paid_fetch(
                 commit_batch_settlement(
                     session_cache,
                     &corrective.requirements,
+                    &retry.payer,
                     &retry.voucher,
                     &outcome,
                 );
@@ -1193,6 +1194,7 @@ fn do_paid_fetch(
             commit_batch_settlement(
                 session_cache,
                 &challenge.requirements,
+                &built.payer,
                 &built.voucher,
                 &outcome,
             );
@@ -1461,6 +1463,7 @@ fn batch_deposit(challenge: &pay_core::client::x402::BatchChallenge) -> Option<u
 fn commit_batch_settlement(
     session_cache: &SessionCache,
     requirements: &pay_core::client::batch::Requirements,
+    payer: &str,
     voucher: &pay_core::client::batch::Voucher,
     outcome: &pay_core::client::runner::RunOutcome,
 ) {
@@ -1472,6 +1475,7 @@ fn commit_batch_settlement(
     };
     if let Err(error) = session_cache.batch_channels.apply_settlement_from_headers(
         requirements,
+        payer,
         voucher,
         response_headers,
     ) {

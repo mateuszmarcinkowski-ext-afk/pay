@@ -303,6 +303,33 @@ struct ChannelOffer<'a> {
     recent_blockhash: Option<&'a str>,
 }
 
+/// The pay network a channel offer is paid on, after checking it against a
+/// forced network.
+fn channel_network(
+    offer_network: &str,
+    recent_blockhash: Option<&str>,
+    network_override: Option<&str>,
+) -> Result<String> {
+    // Channel requirements carry only the CAIP-2 `network` (no `cluster`), so
+    // map it to one. Normalize to a pay slug ("mainnet-beta" -> "mainnet"):
+    // `cluster_for_caip2_network` returns the SDK cluster name, and the bare
+    // `to_string` arm used to win, so `check_client_network_intent` rejected
+    // `--mainnet` and `account_for_network` missed wallets keyed under
+    // "mainnet". A Surfpool blockhash overrides the mapping to localnet.
+    let cluster_raw = pay_kit::x402::exact::cluster_for_caip2_network(offer_network)
+        .map(normalize_network)
+        .unwrap_or_else(|| normalize_network(offer_network));
+    let surfpool_detected = recent_blockhash
+        .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
+    let cluster = if surfpool_detected {
+        "localnet".to_string()
+    } else {
+        cluster_raw
+    };
+    crate::client::mpp::check_client_network_intent(network_override, &cluster, recent_blockhash)?;
+    Ok(network_override.map(str::to_string).unwrap_or(cluster))
+}
+
 /// Prepare a channel payment against `offer`.
 fn prepare_channel_payment(
     offer: ChannelOffer<'_>,
@@ -333,32 +360,12 @@ fn prepare_channel_payment(
         )
     };
 
-    // Channel requirements carry only the CAIP-2 `network` (no `cluster`), so
-    // map it to one. Normalize to a pay slug ("mainnet-beta" -> "mainnet"):
-    // `cluster_for_caip2_network` returns the SDK cluster name, and the bare
-    // `to_string` arm used to win, so `check_client_network_intent` rejected
-    // `--mainnet` and `account_for_network` missed wallets keyed under
-    // "mainnet". A Surfpool blockhash overrides the mapping to localnet.
-    let cluster_raw = pay_kit::x402::exact::cluster_for_caip2_network(offer.network)
-        .map(normalize_network)
-        .unwrap_or_else(|| normalize_network(offer.network));
+    let network = channel_network(offer.network, offer.recent_blockhash, network_override)?;
     let surfpool_detected = offer
         .recent_blockhash
         .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
-    let cluster = if surfpool_detected {
-        "localnet".to_string()
-    } else {
-        cluster_raw
-    };
-    crate::client::mpp::check_client_network_intent(
-        network_override,
-        &cluster,
-        offer.recent_blockhash,
-    )?;
-
     let should_auto_fund_surfpool =
         should_auto_fund_surfpool_for_x402(network_override, offer.recent_blockhash);
-    let network = network_override.map(str::to_string).unwrap_or(cluster);
 
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_payment_with_intent_and_override(
@@ -522,6 +529,8 @@ pub fn parse_batch(headers: &[(String, String)], body: Option<&str>) -> Option<B
 pub struct BuiltBatchPayment {
     pub payment: BuiltPayment,
     pub voucher: pay_kit::x402::batch_settlement::BatchVoucher,
+    /// The channel's payer, which keys it in the cache.
+    pub payer: String,
 }
 
 /// Build a signed x402 `batch-settlement` payment.
@@ -552,11 +561,23 @@ pub fn build_batch_payment(
     let price = requirements
         .amount()
         .map_err(|e| Error::Mpp(format!("invalid batch-settlement amount: {e}")))?;
-    let existing = cache.get(requirements)?;
-    let escrow_amount = match existing.as_ref() {
+    let network = channel_network(
+        &requirements.network,
+        requirements.extra.recent_blockhash.as_deref(),
+        network_override,
+    )?;
+    // The channel is looked up by the payer accounts.yml records, so reusing it
+    // never touches the signer — and never picks another account's channel.
+    let payer = crate::signer::configured_pubkey_for_network(&network, store, account_override)?;
+    let existing = match payer.as_deref() {
+        Some(payer) => cache.get(requirements, payer)?,
+        None => None,
+    };
+    let escrow_for = |existing: Option<&crate::client::batch::CachedChannel>| match existing {
         Some(entry) if entry.channel.can_cover(price) => None,
         Some(_) | None => Some(deposit_amount.unwrap_or(price).max(price)),
     };
+    let escrow_amount = escrow_for(existing.as_ref());
     // Return before `prepare_channel_payment`: merely resolving the funding
     // signer touches a hardware wallet over USB, which may be unplugged by now.
     if let Some(entry) = existing.as_ref()
@@ -584,6 +605,7 @@ pub fn build_batch_payment(
                 ephemeral_notice: None,
             },
             voucher,
+            payer: entry.channel.config().payer.clone(),
         });
     }
 
@@ -607,6 +629,27 @@ pub fn build_batch_payment(
         resource_url,
         auth_override,
     )?;
+    let signer_pubkey = signer.pubkey().to_string();
+    // Checked with or without a cached channel: on a miss, a wrong recorded
+    // pubkey would otherwise open a new funded channel on every request.
+    if let Some(payer) = payer.as_deref()
+        && payer != signer_pubkey
+    {
+        return Err(Error::Config(format!(
+            "accounts.yml records pubkey {payer} for this account, which does not match its \
+             signer {signer_pubkey}; refusing to pay from it."
+        )));
+    }
+    // Without a recorded pubkey the channel can only be found once the signer is
+    // known.
+    let (existing, escrow_amount) = match existing {
+        None if payer.is_none() => {
+            let existing = cache.get(requirements, &signer_pubkey)?;
+            let escrow_amount = escrow_for(existing.as_ref());
+            (existing, escrow_amount)
+        }
+        other => (other, escrow_amount),
+    };
     // A hardware wallet cannot sign raw-message vouchers, so it only funds the
     // channel and an ephemeral key becomes its `authorized_signer`. That key is
     // a PDA seed, so an existing channel keeps the one it was opened with.
@@ -723,6 +766,7 @@ pub fn build_batch_payment(
             ephemeral_notice,
         },
         voucher,
+        payer: signer_pubkey,
     })
 }
 
@@ -2083,6 +2127,210 @@ mod tests {
                 transaction_versions: None,
             },
         }
+    }
+
+    fn keypair_b58(seed: u8) -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(key.as_bytes());
+        bytes[32..].copy_from_slice(key.verifying_key().as_bytes());
+        bs58::encode(bytes).into_string()
+    }
+
+    fn devnet_ephemeral_account(pubkey_seed: u8, secret_seed: Option<u8>) -> Account {
+        Account {
+            backend: BackendKind::Ephemeral,
+            provider: None,
+            active: true,
+            auth_required: Some(false),
+            pubkey: Some(signer_from_seed(pubkey_seed).pubkey().to_string()),
+            vault: None,
+            account: None,
+            path: None,
+            secret_key_b58: secret_seed.map(keypair_b58),
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A devnet batch offer with account `a`'s channel (payer seed 7) already
+    /// cached, beside an unrelated account `b` with no secret: loading `b`
+    /// fails before any network call.
+    fn cached_batch_channel(
+        a_secret_seed: Option<u8>,
+        cache_voucher_key: bool,
+    ) -> (
+        BatchChallenge,
+        MemoryAccountsStore,
+        crate::client::batch::BatchChannelCache,
+    ) {
+        let sponsor = solana_pubkey::Pubkey::new_from_array([3u8; 32]);
+        let receiver = solana_pubkey::Pubkey::new_from_array([4u8; 32]);
+        let mut requirements = batch_requirements(&receiver.to_string(), &sponsor.to_string());
+        requirements.network = SOLANA_DEVNET.to_string();
+        let terms = pay_kit::x402::client::batch_settlement::BatchTerms {
+            fee_payer: sponsor,
+            mint: requirements.asset.parse().unwrap(),
+            token_program: requirements.extra.token_program.parse().unwrap(),
+            receiver,
+            withdraw_delay: requirements.extra.withdraw_delay,
+            amount: 1_000,
+            memo: "batch-cache-test".to_string(),
+            tx_version: pay_kit::core::tx::TxVersion::V0,
+        };
+        let voucher_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (channel, _) = rt
+            .block_on(build_batch_open(
+                &signer_from_seed(7),
+                &memory_signer_for(&voucher_key).unwrap(),
+                &requirements,
+                &terms,
+                10_000,
+                solana_hash::Hash::default(),
+                42,
+            ))
+            .unwrap();
+        let cache = crate::client::batch::BatchChannelCache::new();
+        cache
+            .insert(
+                &requirements,
+                crate::client::batch::CachedChannel {
+                    channel,
+                    voucher_key: cache_voucher_key.then_some(voucher_key),
+                },
+            )
+            .unwrap();
+
+        let mut file = AccountsFile::default();
+        file.upsert("devnet", "a", devnet_ephemeral_account(7, a_secret_seed));
+        file.upsert("devnet", "b", devnet_ephemeral_account(11, None));
+        let challenge = BatchChallenge {
+            requirements,
+            error: None,
+        };
+        (challenge, MemoryAccountsStore::with_file(file), cache)
+    }
+
+    #[test]
+    fn batch_fast_path_does_not_reuse_another_accounts_channel() {
+        let (challenge, store, cache) = cached_batch_channel(None, true);
+
+        let err = build_batch_payment(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            Some("b"),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("secret_key_b58"), "{err}");
+    }
+
+    #[test]
+    fn batch_fast_path_reuses_the_payers_channel_without_loading_its_signer() {
+        use pay_kit::x402::batch_settlement::BatchPayload;
+
+        let (challenge, store, cache) = cached_batch_channel(None, true);
+
+        let built = build_batch_payment(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let header = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &built.payment.headers[0].1,
+        )
+        .unwrap();
+        let envelope: pay_kit::x402::batch_settlement::BatchPaymentPayload =
+            serde_json::from_slice(&header).unwrap();
+        let payload = envelope.payload;
+        let BatchPayload::Voucher { channel_config, .. } = payload else {
+            panic!("a covered request must be a plain voucher");
+        };
+        assert_eq!(
+            channel_config.payer,
+            signer_from_seed(7).pubkey().to_string()
+        );
+    }
+
+    #[test]
+    fn batch_fast_path_enforces_the_forced_network() {
+        let (challenge, store, cache) = cached_batch_channel(None, true);
+
+        let err = build_batch_payment(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            Some("mainnet"),
+            Some("a"),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("you forced network `mainnet`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn batch_payment_refuses_a_channel_whose_payer_is_not_the_signer() {
+        // accounts.yml records seed 7's pubkey for `a`, but its secret is seed 8.
+        let (challenge, store, cache) = cached_batch_channel(Some(8), false);
+
+        let err = build_batch_payment(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn batch_payment_refuses_a_recorded_payer_that_is_not_the_signer_before_opening() {
+        // accounts.yml records seed 7's pubkey for `a`, but its secret is seed 8,
+        // and no channel is cached: without the check every request would open one.
+        let (challenge, store, _) = cached_batch_channel(Some(8), false);
+        let empty = crate::client::batch::BatchChannelCache::new();
+
+        let err = build_batch_payment(
+            &challenge,
+            &store,
+            &empty,
+            None,
+            None,
+            Some("a"),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("does not match"), "{err}");
     }
 
     #[test]

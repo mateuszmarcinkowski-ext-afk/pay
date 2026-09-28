@@ -37,15 +37,17 @@ use crate::{Error, Result};
 /// Every component is a channel-PDA seed or an immutable channel property, so
 /// two offers that differ in any of them cannot share a channel — reusing one
 /// across, say, two `payTo` addresses would sign vouchers redeemable by the
-/// wrong receiver.
-fn cache_key(requirements: &BatchRequirements) -> String {
+/// wrong receiver. The payer is a seed too: a voucher for account A's channel
+/// must never be followed by account B's top-up.
+fn cache_key(requirements: &BatchRequirements, payer: &str) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         requirements.network,
         requirements.asset,
         requirements.pay_to,
         requirements.extra.fee_payer,
         requirements.extra.withdraw_delay,
+        payer,
     )
 }
 
@@ -69,24 +71,29 @@ impl BatchChannelCache {
         Self::default()
     }
 
-    /// The channel already open for this offer, if any.
-    pub fn get(&self, requirements: &BatchRequirements) -> Result<Option<CachedChannel>> {
+    /// The channel `payer` already has open for this offer, if any.
+    pub fn get(
+        &self,
+        requirements: &BatchRequirements,
+        payer: &str,
+    ) -> Result<Option<CachedChannel>> {
         let channels = self.lock()?;
-        Ok(channels.get(&cache_key(requirements)).cloned())
+        Ok(channels.get(&cache_key(requirements, payer)).cloned())
     }
 
-    /// Remember a channel opened for this offer.
+    /// Remember a channel opened for this offer, under the payer it records.
     pub fn insert(&self, requirements: &BatchRequirements, entry: CachedChannel) -> Result<()> {
         let mut channels = self.lock()?;
-        channels.insert(cache_key(requirements), entry);
+        let key = cache_key(requirements, &entry.channel.config().payer);
+        channels.insert(key, entry);
         Ok(())
     }
 
     /// Forget a channel — after a close, or when the server no longer
     /// recognizes it and the client must open a fresh one.
-    pub fn remove(&self, requirements: &BatchRequirements) -> Result<()> {
+    pub fn remove(&self, requirements: &BatchRequirements, payer: &str) -> Result<()> {
         let mut channels = self.lock()?;
-        channels.remove(&cache_key(requirements));
+        channels.remove(&cache_key(requirements, payer));
         Ok(())
     }
 
@@ -100,11 +107,12 @@ impl BatchChannelCache {
     pub fn apply_settlement(
         &self,
         requirements: &BatchRequirements,
+        payer: &str,
         submitted: &BatchVoucher,
         response: &BatchSettlementResponse,
     ) -> Result<u64> {
         let mut channels = self.lock()?;
-        let key = cache_key(requirements);
+        let key = cache_key(requirements, payer);
         let entry = channels.get_mut(&key).ok_or_else(|| {
             Error::Mpp("no cached batch-settlement channel for this offer".to_string())
         })?;
@@ -121,9 +129,13 @@ impl BatchChannelCache {
     /// signed; the channel refuses anything it cannot verify against its own
     /// authorizer key. A channel the server no longer knows about is dropped so
     /// the next attempt opens a fresh one.
-    pub fn adopt_corrective(&self, requirements: &BatchRequirements) -> Result<Option<u64>> {
+    pub fn adopt_corrective(
+        &self,
+        requirements: &BatchRequirements,
+        payer: &str,
+    ) -> Result<Option<u64>> {
         let mut channels = self.lock()?;
-        let key = cache_key(requirements);
+        let key = cache_key(requirements, payer);
         let Some(entry) = channels.get_mut(&key) else {
             return Ok(None);
         };
@@ -150,13 +162,14 @@ impl BatchChannelCache {
     pub fn apply_settlement_from_headers(
         &self,
         requirements: &BatchRequirements,
+        payer: &str,
         submitted: &BatchVoucher,
         response_headers: &[(String, String)],
     ) -> Result<Option<u64>> {
         let Some(response) = decode_settlement(response_headers) else {
             return Ok(None);
         };
-        self.apply_settlement(requirements, submitted, &response)
+        self.apply_settlement(requirements, payer, submitted, &response)
             .map(Some)
     }
 
@@ -212,32 +225,49 @@ mod tests {
         // A channel is bound to its receiver and its sponsor; reusing one across
         // either would sign vouchers redeemable by the wrong party.
         assert_ne!(
-            cache_key(&base),
-            cache_key(&requirements("payTo2", "feePayer1"))
+            cache_key(&base, "payer"),
+            cache_key(&requirements("payTo2", "feePayer1"), "payer")
         );
         assert_ne!(
-            cache_key(&base),
-            cache_key(&requirements("payTo1", "feePayer2"))
+            cache_key(&base, "payer"),
+            cache_key(&requirements("payTo1", "feePayer2"), "payer")
         );
 
         let mut different_delay = requirements("payTo1", "feePayer1");
         different_delay.extra.withdraw_delay = 900;
-        assert_ne!(cache_key(&base), cache_key(&different_delay));
+        assert_ne!(
+            cache_key(&base, "payer"),
+            cache_key(&different_delay, "payer")
+        );
 
         // The per-request price is not a channel property: the same channel
         // funds cheap and expensive routes alike.
         let mut different_price = requirements("payTo1", "feePayer1");
         different_price.amount = "5000".to_string();
-        assert_eq!(cache_key(&base), cache_key(&different_price));
+        assert_eq!(
+            cache_key(&base, "payer"),
+            cache_key(&different_price, "payer")
+        );
+    }
+
+    #[test]
+    fn a_channel_is_not_shared_across_payers() {
+        let requirements = requirements("payTo1", "feePayer1");
+        assert_ne!(cache_key(&requirements, "A"), cache_key(&requirements, "B"));
     }
 
     #[test]
     fn an_unknown_channel_reports_nothing_rather_than_failing() {
         let cache = BatchChannelCache::new();
         let requirements = requirements("payTo1", "feePayer1");
-        assert!(cache.get(&requirements).unwrap().is_none());
-        assert!(cache.adopt_corrective(&requirements).unwrap().is_none());
+        assert!(cache.get(&requirements, "payer").unwrap().is_none());
+        assert!(
+            cache
+                .adopt_corrective(&requirements, "payer")
+                .unwrap()
+                .is_none()
+        );
         // Removing something absent is a no-op, so a close is idempotent.
-        cache.remove(&requirements).unwrap();
+        cache.remove(&requirements, "payer").unwrap();
     }
 }
