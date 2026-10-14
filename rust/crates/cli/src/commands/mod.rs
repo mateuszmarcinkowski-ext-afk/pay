@@ -1753,10 +1753,8 @@ fn pay_upto_and_retry(
 /// A one-shot CLI run has nowhere to keep a channel between invocations, so it
 /// opens one, escrows exactly this request's price, and spends it. The scheme
 /// pays off in a long-lived host — the MCP server keeps its channels for the
-/// life of the connection, but currently tops up one request at a time. A
-/// larger deposit option can amortize funding transactions in a follow-up. The
-/// escrow is never stranded either way: the payer can force-close and recover
-/// whatever is unspent after the advertised `withdrawDelay`.
+/// life of the connection and escrows many requests per `open`. Unspent escrow
+/// is not refunded automatically.
 fn pay_batch_and_retry(
     challenge: &x402::BatchChallenge,
     resource_url: &str,
@@ -1890,7 +1888,7 @@ fn pay_session_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (_handle, auth_header) = pay_core::session::open_payment_channel_session_header(
+    let (handle, auth_header) = pay_core::session::open_payment_channel_session_header(
         challenge,
         request,
         &store,
@@ -1904,7 +1902,27 @@ fn pay_session_and_retry(
     let receipt_network = network_override
         .map(str::to_string)
         .or_else(|| mpp_challenge_network(challenge));
-    let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
+    let retry_outcome =
+        retry_with_header(tool, "Authorization", &auth_header, fetch_headers.clone())?;
+
+    // `open` only registers the channel; the server answers 402 until a voucher arrives.
+    let retry_outcome = match retry_outcome {
+        RunOutcome::SessionChallenge { .. } | RunOutcome::UnknownPaymentRequired { .. } => {
+            let unit_price: u64 = request.amount.parse().map_err(|_| {
+                pay_core::Error::Mpp(format!(
+                    "session challenge carried a non-numeric unit price: {}",
+                    request.amount
+                ))
+            })?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| pay_core::Error::Config(format!("Failed to create runtime: {e}")))?;
+            let voucher_header = rt.block_on(handle.voucher_header(unit_price))?;
+            retry_with_header(tool, "Authorization", &voucher_header, fetch_headers)?
+        }
+        settled => settled,
+    };
     handle_retry_outcome(
         retry_outcome,
         is_json,

@@ -340,6 +340,35 @@ pub fn backend_for_network(
     }
 }
 
+/// Whether accounts.yml names an account for `network`; a throwaway wallet
+/// created at payment time does not count.
+pub(crate) fn has_configured_account(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+) -> Result<bool> {
+    let file = store.load()?;
+    Ok(matches!(
+        select_account(&file, network, account_override),
+        Ok(AccountSelection::Configured { .. })
+    ))
+}
+
+/// The pubkey accounts.yml records for the account that pays on `network`,
+/// read without touching its secret. `None` when no pubkey is recorded or a
+/// throwaway wallet will be created at payment time.
+pub(crate) fn configured_pubkey_for_network(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+) -> Result<Option<String>> {
+    let file = store.load()?;
+    match select_account(&file, network, account_override)? {
+        AccountSelection::Configured { account, .. } => Ok(account.pubkey.clone()),
+        AccountSelection::LazyEphemeral { .. } => Ok(None),
+    }
+}
+
 /// Whether the configured signer can produce raw message signatures.
 ///
 /// Returning only a boolean keeps account-derived configuration data out of

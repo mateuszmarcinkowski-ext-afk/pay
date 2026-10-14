@@ -660,7 +660,7 @@ impl RunOutcome {
                     .unwrap_or(request.method_details.network)
             }
             RunOutcome::X402SignInChallenge { challenge, .. } => {
-                match x402::sign_in_chain(challenge, network_override) {
+                match x402::sign_in_chain(challenge, store, network_override, account_override) {
                     Ok((_, network)) => network,
                     Err(_) => return Ok(None),
                 }
@@ -2341,8 +2341,7 @@ HTTP request sent, awaiting response...
     }
 
     #[cfg(feature = "ledger")]
-    #[test]
-    fn configured_signer_lets_a_ledger_account_pay_the_charge() {
+    fn ledger_mainnet_store() -> crate::accounts::MemoryAccountsStore {
         let mut file = crate::accounts::AccountsFile::default();
         file.upsert(
             "mainnet",
@@ -2361,7 +2360,13 @@ HTTP request sent, awaiting response...
                 subscriptions: Default::default(),
             },
         );
-        let store = crate::accounts::MemoryAccountsStore::with_file(file);
+        crate::accounts::MemoryAccountsStore::with_file(file)
+    }
+
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn configured_signer_lets_a_ledger_account_pay_the_charge() {
+        let store = ledger_mainnet_store();
         let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r");
         let support = outcome
             .configured_signer_support(&store, None, None)
@@ -2370,8 +2375,66 @@ HTTP request sent, awaiting response...
         assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
     }
 
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn configured_signer_pays_instead_of_signing_in_with_a_mainnet_ledger() {
+        // QuickNode lists devnet first; the sign-in must still resolve to the
+        // mainnet Ledger so it pays instead of failing to sign in.
+        let store = ledger_mainnet_store();
+        let headers = siwx_with_payment_402_on(&[
+            pay_kit::x402::exact::SOLANA_DEVNET,
+            pay_kit::x402::exact::SOLANA_MAINNET,
+        ]);
+        let outcome = classify_402(&headers, None, "https://e.com/r");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::X402SignInChallenge {
+                    payment_fallback: Some(_),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        assert_eq!(support, Some(false));
+        let outcome = outcome.for_signer_support(support);
+        assert!(
+            matches!(outcome, RunOutcome::X402Challenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn configured_signer_signs_in_on_devnet_without_a_mainnet_account() {
+        // Nothing configured: the sign-in answers on the first chain offered,
+        // where a throwaway devnet wallet can sign it.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let headers = siwx_with_payment_402_on(&[
+            pay_kit::x402::exact::SOLANA_DEVNET,
+            pay_kit::x402::exact::SOLANA_MAINNET,
+        ]);
+        let outcome = classify_402(&headers, None, "https://e.com/r");
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        assert_eq!(support, None);
+        let outcome = outcome.for_signer_support(support);
+        assert!(
+            matches!(outcome, RunOutcome::X402SignInChallenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
     /// An x402 402 offering sign-in-with-x beside an exact payment.
     fn siwx_with_payment_402() -> Vec<(String, String)> {
+        siwx_with_payment_402_on(&[pay_kit::x402::exact::SOLANA_MAINNET])
+    }
+
+    /// Like [`siwx_with_payment_402`], signing in on `chains` in that order.
+    fn siwx_with_payment_402_on(chains: &[&str]) -> Vec<(String, String)> {
         use base64::Engine;
         let payment_required = serde_json::json!({
             pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
@@ -2394,11 +2457,14 @@ HTTP request sent, awaiting response...
                         "nonce": "nonce-123",
                         "issuedAt": "2026-04-27T00:00:00Z"
                     },
-                    "supportedChains": [{
-                        "chainId": pay_kit::x402::exact::SOLANA_MAINNET,
-                        "type": "ed25519",
-                        "signatureScheme": "siws"
-                    }]
+                    "supportedChains": chains
+                        .iter()
+                        .map(|chain| serde_json::json!({
+                            "chainId": chain,
+                            "type": "ed25519",
+                            "signatureScheme": "siws"
+                        }))
+                        .collect::<Vec<_>>()
                 }
             }
         });
@@ -3281,5 +3347,238 @@ HTTP request sent, awaiting response...
     fn check_command_exists_fails_for_nonexistent() {
         let result = check_command_exists("nonexistent_command_xyz_12345");
         assert!(result.is_err());
+    }
+
+    // ── Contract tests against 402s recorded from pay.sh-compatible gateways ──
+    //
+    // The fixtures under `tests/fixtures/pay-sh/` keep only the payment headers
+    // of real responses (recorded 2026-09-24), one `name: value` per line.
+
+    /// Parse a recorded `.402-headers.txt` fixture into response headers.
+    fn recorded_headers(raw: &str) -> Vec<(String, String)> {
+        raw.lines()
+            .map(|line| line.split_once(": ").expect("malformed fixture line"))
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    const QUICKNODE_HEADERS: &str =
+        include_str!("../../tests/fixtures/pay-sh/quicknode-solana-mainnet.402-headers.txt");
+    const QUICKNODE_BODY: &str =
+        include_str!("../../tests/fixtures/pay-sh/quicknode-solana-mainnet.body");
+    const BIGQUERY_HEADERS: &str =
+        include_str!("../../tests/fixtures/pay-sh/bigquery-gateway402.402-headers.txt");
+    const BIGQUERY_BODY: &str =
+        include_str!("../../tests/fixtures/pay-sh/bigquery-gateway402.body");
+    const ALIBABA_HEADERS: &str =
+        include_str!("../../tests/fixtures/pay-sh/alibaba-translate-gateway402.402-headers.txt");
+    const ALIBABA_BODY: &str =
+        include_str!("../../tests/fixtures/pay-sh/alibaba-translate-gateway402.body");
+
+    const QUICKNODE_URL: &str = "https://x402.quicknode.com/solana-mainnet";
+    const GATEWAY_URL: &str = "https://gateway402.example/resource";
+
+    /// Classify a recorded 402 as the default (`Auto`) client does, without
+    /// reading `PAY_PROTOCOL_ENFORCED` from the environment.
+    fn classify_recorded(headers: &str, body: &str, url: &str) -> RunOutcome {
+        classify_402_with_preference(
+            &recorded_headers(headers),
+            Some(body),
+            url,
+            ProtocolPreference::Auto,
+        )
+    }
+
+    fn assert_cheapest_solana_mainnet_offer(challenge: &x402::Challenge) {
+        assert_eq!(
+            challenge.requirements.network,
+            pay_kit::x402::exact::SOLANA_MAINNET
+        );
+        // QuickNode offers 10000000 and 1000 on mainnet; the cheaper one wins.
+        assert_eq!(challenge.requirements.amount, "1000");
+    }
+
+    #[test]
+    fn recorded_headers_parse_every_fixture_line() {
+        let headers = recorded_headers(BIGQUERY_HEADERS);
+        assert_eq!(headers.len(), BIGQUERY_HEADERS.lines().count());
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name == "www-authenticate")
+                .count(),
+            5
+        );
+        assert!(headers.iter().any(|(name, _)| name == "payment-required"));
+    }
+
+    #[test]
+    fn quicknode_offers_sign_in_with_the_cheapest_mainnet_payment_as_fallback() {
+        let outcome = classify_recorded(QUICKNODE_HEADERS, QUICKNODE_BODY, QUICKNODE_URL);
+        let RunOutcome::X402SignInChallenge {
+            payment_fallback: Some(payment),
+            ..
+        } = &outcome
+        else {
+            panic!("sign-in with a payment fallback is expected: {outcome:?}");
+        };
+        assert_cheapest_solana_mainnet_offer(payment);
+    }
+
+    #[test]
+    fn quicknode_signs_in_with_a_signer_that_signs_raw_messages() {
+        use crate::backend::testing::SignsAnything;
+        let outcome = classify_recorded(QUICKNODE_HEADERS, QUICKNODE_BODY, QUICKNODE_URL)
+            .for_signer(&SignsAnything);
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::X402SignInChallenge {
+                    payment_fallback: Some(_),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn quicknode_pays_the_cheapest_mainnet_offer_with_a_transactions_only_signer() {
+        use crate::backend::testing::TransactionsOnly;
+        let outcome = classify_recorded(QUICKNODE_HEADERS, QUICKNODE_BODY, QUICKNODE_URL)
+            .for_signer(&TransactionsOnly);
+        let RunOutcome::X402Challenge { challenge, .. } = &outcome else {
+            panic!("a transactions-only signer must pay instead of signing in: {outcome:?}");
+        };
+        assert_cheapest_solana_mainnet_offer(challenge);
+    }
+
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn quicknode_pays_the_cheapest_mainnet_offer_with_a_mainnet_ledger() {
+        // The recorded sign-in lists devnet before mainnet.
+        let store = ledger_mainnet_store();
+        let outcome = classify_recorded(QUICKNODE_HEADERS, QUICKNODE_BODY, QUICKNODE_URL);
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        assert_eq!(support, Some(false));
+        let outcome = outcome.for_signer_support(support);
+        let RunOutcome::X402Challenge { challenge, .. } = &outcome else {
+            panic!("a Ledger must pay instead of signing in: {outcome:?}");
+        };
+        assert_cheapest_solana_mainnet_offer(challenge);
+    }
+
+    #[test]
+    fn quicknode_sign_in_needs_no_mainnet_account_when_devnet_is_offered() {
+        // Only a lazily created devnet wallet: nothing is configured on mainnet.
+        // The recorded sign-in also offers devnet, which that wallet can sign.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let outcome = classify_recorded(QUICKNODE_HEADERS, QUICKNODE_BODY, QUICKNODE_URL);
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .expect("sign-in must not require a mainnet account");
+        let outcome = outcome.for_signer_support(support);
+        assert!(
+            matches!(outcome, RunOutcome::X402SignInChallenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    fn assert_bigquery_charge(outcome: &RunOutcome) {
+        let RunOutcome::MppChallenge {
+            challenge,
+            alternatives,
+            x402_alternative,
+            ..
+        } = outcome
+        else {
+            panic!("the MPP charge is expected: {outcome:?}");
+        };
+        assert_eq!(challenge.intent.as_str(), "charge");
+        assert_eq!(challenge.method.as_str(), "solana");
+        // One charge per stablecoin; the rest stay available to the selector.
+        assert_eq!(alternatives.len(), 4);
+        let x402 = x402_alternative
+            .as_ref()
+            .expect("the x402 exact offer is carried as an alternative");
+        assert_eq!(
+            x402.requirements.network,
+            pay_kit::x402::exact::SOLANA_MAINNET
+        );
+    }
+
+    #[test]
+    fn bigquery_pays_the_mpp_charge_with_either_signer() {
+        use crate::backend::testing::{SignsAnything, TransactionsOnly};
+        let classified = || classify_recorded(BIGQUERY_HEADERS, BIGQUERY_BODY, GATEWAY_URL);
+        assert_bigquery_charge(&classified());
+        assert_bigquery_charge(&classified().for_signer(&SignsAnything));
+        assert_bigquery_charge(&classified().for_signer(&TransactionsOnly));
+    }
+
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn bigquery_pays_the_mpp_charge_with_a_mainnet_ledger() {
+        let store = ledger_mainnet_store();
+        let outcome = classify_recorded(BIGQUERY_HEADERS, BIGQUERY_BODY, GATEWAY_URL);
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        // A charge needs no raw message signature, so no capability is checked.
+        assert_eq!(support, None);
+        assert_bigquery_charge(&outcome.for_signer_support(support));
+    }
+
+    fn assert_alibaba_session(outcome: &RunOutcome) {
+        let RunOutcome::SessionChallenge {
+            challenge,
+            fallback,
+            ..
+        } = outcome
+        else {
+            panic!("the client-signed session is expected: {outcome:?}");
+        };
+        assert!(crate::client::session::challenge_is_client_signed(challenge).unwrap());
+        let request = challenge
+            .request
+            .decode::<pay_kit::mpp::SessionRequest>()
+            .unwrap();
+        assert_eq!(request.method_details.network, "mainnet");
+        assert_eq!(
+            request.method_details.channel_program,
+            "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX"
+        );
+        assert_eq!(request.suggested_deposit.as_deref(), Some("100000"));
+        let Some(RunOutcome::X402UptoChallenge { challenge, .. }) = fallback.as_deref() else {
+            panic!("the x402 upto offer is the session's fallback: {fallback:?}");
+        };
+        assert_eq!(challenge.requirements.scheme, "upto");
+        assert_eq!(
+            challenge.requirements.network,
+            pay_kit::x402::exact::SOLANA_MAINNET
+        );
+    }
+
+    #[test]
+    fn alibaba_keeps_the_client_signed_session_with_either_signer() {
+        use crate::backend::testing::{SignsAnything, TransactionsOnly};
+        let classified = || classify_recorded(ALIBABA_HEADERS, ALIBABA_BODY, GATEWAY_URL);
+        assert_alibaba_session(&classified());
+        assert_alibaba_session(&classified().for_signer(&SignsAnything));
+        assert_alibaba_session(&classified().for_signer(&TransactionsOnly));
+    }
+
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn alibaba_keeps_the_client_signed_session_with_a_mainnet_ledger() {
+        let store = ledger_mainnet_store();
+        let outcome = classify_recorded(ALIBABA_HEADERS, ALIBABA_BODY, GATEWAY_URL);
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        assert_eq!(support, Some(false));
+        assert_alibaba_session(&outcome.for_signer_support(support));
     }
 }

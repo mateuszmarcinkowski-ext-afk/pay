@@ -538,6 +538,86 @@ pub fn open_operator_signed_session_authorizations(
     Ok((open_authorization, use_authorization))
 }
 
+/// Only client-signed sessions work with a hardware wallet: the operator-signed
+/// payer proof is a raw-message signature the device cannot produce.
+pub fn challenge_is_client_signed(challenge: &PaymentChallenge) -> Result<bool> {
+    let request: SessionRequest = challenge
+        .request
+        .decode()
+        .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+    Ok(request
+        .method_details
+        .voucher_signer
+        .unwrap_or(SessionVoucherSigner::Client)
+        == SessionVoucherSigner::Client)
+}
+
+/// Returns the handle, the `open` `Authorization` header, the unit price and
+/// the deposit the `open` escrows.
+///
+/// The caller keeps the handle and signs a voucher from it per request. The
+/// `authorized_signer` is an in-process ephemeral key, so a hardware wallet
+/// signs only the `open` transaction.
+pub fn open_client_signed_session(
+    challenge: &PaymentChallenge,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: &str,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<(SessionHandle, String, u64, u64)> {
+    let request: SessionRequest = challenge
+        .request
+        .decode()
+        .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+    if request.method_details.voucher_signer == Some(SessionVoucherSigner::Operator) {
+        return Err(Error::Mpp(
+            "this challenge asks for an operator-signed MPP session".to_string(),
+        ));
+    }
+    if let Some(forced) = network_override
+        && forced != request.method_details.network
+    {
+        return Err(Error::Mpp(format!(
+            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
+            request.method_details.network
+        )));
+    }
+    let unit_price = request.amount.parse::<u64>().map_err(|_| {
+        Error::Mpp(format!(
+            "session challenge carried a non-numeric unit price: {}",
+            request.amount
+        ))
+    })?;
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(0);
+    let deposit = request
+        .suggested_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1);
+    let sandbox = network_override == Some("localnet");
+    let (handle, open_authorization) = open_payment_channel_session_header_with_override(
+        challenge,
+        &request,
+        store,
+        network_override,
+        account_override,
+        deposit,
+        resource_url,
+        sandbox,
+        auth_override,
+    )?;
+    Ok((handle, open_authorization, unit_price, deposit))
+}
+
 fn parse_session_deposit(value: &str) -> Result<u64> {
     value.parse::<u64>().map_err(|_| {
         Error::Mpp(format!(
@@ -553,6 +633,15 @@ pub fn voucher_header_sync(handle: &SessionHandle, amount: u64) -> Result<String
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to build runtime: {e}")))?;
     rt.block_on(handle.voucher_header(amount))
+}
+
+/// The cumulative amount a session has authorized so far (base units).
+pub fn cumulative_sync(handle: &SessionHandle) -> Result<u64> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to build runtime: {e}")))?;
+    Ok(rt.block_on(handle.cumulative()))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -926,5 +1015,103 @@ mod tests {
             }
             _ => panic!("expected voucher action"),
         }
+    }
+
+    /// The first MPP session challenge the Alibaba translate gateway sent
+    /// (recorded 2026-09-24): client-signed, mainnet, USDC.
+    fn recorded_alibaba_session_challenge() -> PaymentChallenge {
+        let header = include_str!(
+            "../../tests/fixtures/pay-sh/alibaba-translate-gateway402.402-headers.txt"
+        )
+        .lines()
+        .find_map(|line| line.strip_prefix("www-authenticate: "))
+        .expect("the fixture carries an MPP challenge");
+        SessionHandle::parse_challenge(header)
+            .expect("the fixture's first challenge is a session")
+            .0
+    }
+
+    #[test]
+    fn client_signed_open_delegates_the_voucher_key_without_making_it_a_signer() {
+        use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
+
+        let challenge = recorded_alibaba_session_challenge();
+        assert!(challenge_is_client_signed(&challenge).unwrap());
+        let payer_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(payer_key.as_bytes());
+        keypair[32..].copy_from_slice(payer_key.verifying_key().as_bytes());
+        let payer = bs58::encode(payer_key.verifying_key().as_bytes()).into_string();
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some(payer.clone()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(keypair).into_string()),
+                created_at: None,
+                subscriptions: std::collections::BTreeMap::new(),
+            },
+        );
+        let store = MemoryAccountsStore::with_file(file);
+
+        // The recorded challenge carries its blockhash and slot, so the open
+        // is built without an RPC round trip.
+        let (handle, open_header, unit_price, deposit) = open_client_signed_session(
+            &challenge,
+            &store,
+            None,
+            None,
+            "https://gateway402.example/compatible-mode/v1/chat/completions",
+            None,
+        )
+        .unwrap();
+        assert_eq!(unit_price, 2);
+        assert_eq!(deposit, 100_000);
+
+        let SessionAction::Open(open) = parse_action(&open_header) else {
+            panic!("the first header must open the channel");
+        };
+        assert_eq!(open.payer, payer);
+        assert_eq!(open.deposit_amount, "100000");
+        assert!(open.authentication.is_none());
+        assert_ne!(
+            open.authorized_signer, payer,
+            "vouchers must be signed by a delegated key, not the payer"
+        );
+
+        let tx = pay_kit::core::tx::decode(&open.transaction).unwrap();
+        let signers = usize::from(tx.message.header().num_required_signatures);
+        let keys = tx.message.static_account_keys();
+        let payer_pubkey: Pubkey = payer.parse().unwrap();
+        let delegate: Pubkey = open.authorized_signer.parse().unwrap();
+        assert!(
+            keys[..signers].contains(&payer_pubkey),
+            "the payer must sign the open"
+        );
+        let position = keys
+            .iter()
+            .position(|key| *key == delegate)
+            .expect("the delegated key must be an account of the open");
+        assert!(
+            position >= signers,
+            "the delegated key must never be a required signer, found at index {position}"
+        );
+
+        // The delegated key is the one the handle signs vouchers with.
+        let SessionAction::Voucher(voucher) =
+            parse_action(&voucher_header_sync(&handle, 2).unwrap())
+        else {
+            panic!("expected a voucher action");
+        };
+        assert_eq!(voucher.voucher.signer, open.authorized_signer);
+        assert_eq!(voucher.voucher.data.cumulative_amount, "2");
     }
 }

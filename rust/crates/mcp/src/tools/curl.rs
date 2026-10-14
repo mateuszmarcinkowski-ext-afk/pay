@@ -5,12 +5,33 @@ use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+/// Requests a batch-settlement `open` escrows for, so one `open` backs a whole
+/// MCP session. Unspent escrow is not refunded automatically.
+// todo: fixed multiple, make it configurable if hosts need longer sessions
+// todo: no client-side refund; unspent escrow stays locked until the payer runs request_close + withdraw_payer by hand (only pay-worker/src/bin/close_channels.rs builds them). Ceiling: one abandoned channel per seller per process; build a refund when evictions show up in practice.
+const BATCH_DEPOSIT_REQUESTS: u64 = 100;
+
+/// `unit_price` is cached because a cache hit has no challenge to read it from;
+/// a stale one gets the voucher rejected, which evicts the entry.
+#[derive(Clone)]
+struct ClientSession {
+    handle: pay_core::session::SessionHandle,
+    unit_price: u64,
+    deposit: u64,
+}
+
+/// Whether a session evicted on a refused voucher still held unspent escrow.
+/// A voucher past the deposit is the channel being used up, not stranded.
+fn evicted_with_escrow_left(cumulative: u64, deposit: u64) -> bool {
+    cumulative <= deposit
+}
 
 /// Reusable MPP session authorizations for one MCP server connection.
 ///
@@ -29,8 +50,14 @@ pub(crate) struct SessionCache {
     /// escrow channel backs many requests and the client tracks the cumulative
     /// amount the server has confirmed charging. Holding it here lets a
     /// long-lived MCP connection reuse one channel instead of opening a new
-    /// channel per request. It currently tops up one request at a time.
+    /// channel per request.
     pub(crate) batch_channels: pay_core::client::batch::BatchChannelCache,
+    /// Client-signed MPP session channels. The handle owns the ephemeral voucher
+    /// key, so one wallet approval at `open` covers every later request.
+    client_sessions: Mutex<HashMap<String, ClientSession>>,
+    /// Session routes whose client-signed session was dropped with escrow left.
+    /// That escrow is not refunded, so a new open would lock up another deposit.
+    stranded_routes: Mutex<HashSet<String>>,
 }
 
 impl SessionCache {
@@ -44,9 +71,32 @@ impl SessionCache {
         }
     }
 
-    fn remove(&self, origin: &str) {
+    fn client_session(&self, origin: &str) -> Option<ClientSession> {
+        self.client_sessions.lock().ok()?.get(origin).cloned()
+    }
+
+    fn store_client_session(&self, origin: String, session: ClientSession) {
+        if let Ok(mut sessions) = self.client_sessions.lock() {
+            sessions.insert(origin, session);
+        }
+    }
+
+    fn is_stranded(&self, key: &str) -> bool {
+        self.stranded_routes
+            .lock()
+            .map_or(true, |routes| routes.contains(key))
+    }
+
+    /// Drop a route's session, remembering it when escrow was left behind.
+    fn evict(&self, key: &str, stranded: bool) {
         if let Ok(mut authorizations) = self.authorizations.lock() {
-            authorizations.remove(origin);
+            authorizations.remove(key);
+        }
+        if let Ok(mut sessions) = self.client_sessions.lock() {
+            sessions.remove(key);
+        }
+        if stranded && let Ok(mut routes) = self.stranded_routes.lock() {
+            routes.insert(key.to_string());
         }
     }
 }
@@ -952,14 +1002,23 @@ fn do_paid_fetch(
         _ => extra_headers.to_vec(),
     };
     let session_key = session_cache_key(method, url).ok();
-    let cached_session = session_key.as_deref().and_then(|key| {
-        (!initial_headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")))
-        .then(|| session_cache.authorization(key))
-        .flatten()
-    });
-    if let Some(authorization) = cached_session.as_ref() {
+    let caller_set_authorization = initial_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+    let cached_client_session = session_key
+        .as_deref()
+        .filter(|_| !caller_set_authorization)
+        .and_then(|key| session_cache.client_session(key));
+    let cached_session = session_key
+        .as_deref()
+        .filter(|_| !caller_set_authorization && cached_client_session.is_none())
+        .and_then(|key| session_cache.authorization(key));
+    if let Some(session) = cached_client_session.as_ref() {
+        // todo: the watermark advances on sign, not on confirm, so a failed request
+        // over-authorizes; use prepare/commit vouchers if channels run near their deposit.
+        let voucher = pay_core::session::voucher_header_sync(&session.handle, session.unit_price)?;
+        initial_headers.push(("Authorization".to_string(), voucher));
+    } else if let Some(authorization) = cached_session.as_ref() {
         initial_headers.push(("Authorization".to_string(), authorization.clone()));
     }
 
@@ -973,11 +1032,18 @@ fn do_paid_fetch(
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
-    if cached_session.is_some()
+    if (cached_session.is_some() || cached_client_session.is_some())
         && !matches!(&outcome, RunOutcome::Completed { .. })
         && let Some(key) = session_key.as_deref()
     {
-        session_cache.remove(key);
+        // An unreadable watermark counts as stranded: refusing a re-open is the
+        // side that cannot lock up a second deposit.
+        let stranded = cached_client_session.as_ref().is_some_and(|session| {
+            pay_core::session::cumulative_sync(&session.handle).map_or(true, |cumulative| {
+                evicted_with_escrow_left(cumulative, session.deposit)
+            })
+        });
+        session_cache.evict(key, stranded);
     }
 
     match outcome {
@@ -1093,7 +1159,7 @@ fn do_paid_fetch(
                 &challenge,
                 store,
                 &session_cache.batch_channels,
-                None,
+                batch_deposit(&challenge),
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
@@ -1120,14 +1186,14 @@ fn do_paid_fetch(
                 && corrective.error.is_some()
                 && session_cache
                     .batch_channels
-                    .adopt_corrective(&corrective.requirements)
+                    .adopt_corrective(&corrective.requirements, &built.payer)
                     .is_ok_and(|adopted| adopted.is_some())
             {
                 let retry = pay_core::client::x402::build_batch_payment(
                     corrective,
                     store,
                     &session_cache.batch_channels,
-                    None,
+                    batch_deposit(corrective),
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
@@ -1145,6 +1211,7 @@ fn do_paid_fetch(
                 commit_batch_settlement(
                     session_cache,
                     &corrective.requirements,
+                    &retry.payer,
                     &retry.voucher,
                     &outcome,
                 );
@@ -1154,6 +1221,7 @@ fn do_paid_fetch(
             commit_batch_settlement(
                 session_cache,
                 &challenge.requirements,
+                &built.payer,
                 &built.voucher,
                 &outcome,
             );
@@ -1227,6 +1295,53 @@ fn do_paid_fetch(
                     "MPP session payments require an absolute HTTP(S) URL".to_string(),
                 )
             })?;
+            if pay_core::session::challenge_is_client_signed(&challenge)? {
+                if session_cache.is_stranded(&key) {
+                    return Err(pay_core::Error::Mpp(
+                        "this seller dropped a funded MPP session in this session; refusing \
+                         to escrow another deposit. Restart pay to retry."
+                            .to_string(),
+                    ));
+                }
+                let (handle, open_authorization, unit_price, deposit) =
+                    pay_core::session::open_client_signed_session(
+                        &challenge,
+                        store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        url,
+                        make_auth_override(),
+                    )?;
+                let mut headers = extra_headers.to_vec();
+                headers.push(("Authorization".to_string(), open_authorization));
+                let opened = fetch_request(&headers)?;
+
+                // `open` only registers the channel. The 402 that follows doesn't
+                // re-advertise the challenge, so it surfaces as `UnknownPaymentRequired`.
+                let retry = match opened {
+                    RunOutcome::SessionChallenge { .. }
+                    | RunOutcome::UnknownPaymentRequired { .. } => {
+                        let voucher = pay_core::session::voucher_header_sync(&handle, unit_price)?;
+                        let mut headers = extra_headers.to_vec();
+                        headers.push(("Authorization".to_string(), voucher));
+                        fetch_request(&headers)?
+                    }
+                    settled => settled,
+                };
+                // A spent channel is evicted on its refused voucher and reopened,
+                // which asks the wallet to approve a new deposit.
+                if matches!(&retry, RunOutcome::Completed { .. }) {
+                    session_cache.store_client_session(
+                        key,
+                        ClientSession {
+                            handle,
+                            unit_price,
+                            deposit,
+                        },
+                    );
+                }
+                return interpret_retry(retry);
+            }
             let (open_authorization, use_authorization) =
                 pay_core::session::open_operator_signed_session_authorizations(
                     &challenge,
@@ -1369,6 +1484,16 @@ fn is_user_rejection(reason: &str) -> bool {
     reason.starts_with("rejected by user")
 }
 
+/// pay-core's default escrows one request, making every later call top up on
+/// chain. An unreadable price yields `None` so pay-core rejects it itself.
+fn batch_deposit(challenge: &pay_core::client::x402::BatchChallenge) -> Option<u64> {
+    challenge
+        .requirements
+        .amount()
+        .ok()
+        .map(|price| price.saturating_mul(BATCH_DEPOSIT_REQUESTS))
+}
+
 /// Advance the cached channel watermark from a served response's settlement
 /// receipt.
 ///
@@ -1379,6 +1504,7 @@ fn is_user_rejection(reason: &str) -> bool {
 fn commit_batch_settlement(
     session_cache: &SessionCache,
     requirements: &pay_core::client::batch::Requirements,
+    payer: &str,
     voucher: &pay_core::client::batch::Voucher,
     outcome: &pay_core::client::runner::RunOutcome,
 ) {
@@ -1390,6 +1516,7 @@ fn commit_batch_settlement(
     };
     if let Err(error) = session_cache.batch_channels.apply_settlement_from_headers(
         requirements,
+        payer,
         voucher,
         response_headers,
     ) {
@@ -1415,6 +1542,26 @@ fn interpret_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_cache_refuses_to_reopen_only_the_stranded_route() {
+        let cache = SessionCache::default();
+        let stranded = session_cache_key("POST", "https://seller.example/v1/chat").unwrap();
+        let sibling = session_cache_key("POST", "https://seller.example/v1/embed").unwrap();
+        cache.evict(&stranded, true);
+
+        assert!(cache.is_stranded(&stranded));
+        // Sessions are per route, so another route's session holds no escrow here.
+        assert!(!cache.is_stranded(&sibling));
+    }
+
+    #[test]
+    fn a_spent_session_is_not_counted_as_stranded() {
+        // The refused voucher went past the deposit: the channel was used up.
+        assert!(!evicted_with_escrow_left(1_100, 1_000));
+        // Refused while still within the deposit: escrow is left behind.
+        assert!(evicted_with_escrow_left(300, 1_000));
+    }
 
     #[test]
     fn params_deserialize_minimal() {
