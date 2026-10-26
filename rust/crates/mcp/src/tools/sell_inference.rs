@@ -116,7 +116,7 @@ pub struct Params {
     #[serde(default)]
     pub description: Option<String>,
     /// Idle seconds before a buyer's session channel closes and settles to
-    /// the recipient. Defaults to ten minutes.
+    /// the recipient. Defaults to ten minutes; at most an hour.
     #[serde(default)]
     pub session_idle_close_secs: Option<u32>,
     /// Endpoint to act on for status, reprice and stop. Defaults to the
@@ -136,7 +136,7 @@ pub async fn run(
     peer: Option<Peer<RoleServer>>,
     scope: &CallScope,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    if !scope.body_files {
+    if scope.local_files.is_none() {
         return Ok(super::tool_error(
             "sell_inference serves inference from the machine the agent runs on, and this \
              hosted session has none. Run `pay mcp` locally to sell inference.",

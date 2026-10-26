@@ -54,18 +54,45 @@ pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest a worker's long-poll may ask to wait.
 pub const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
 const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
+/// Largest create or reprice body; endpoint terms are a few hundred bytes.
+const MAX_TERMS_BYTES: usize = 64 * 1024;
+/// Largest body of one worker push; workers split their output to fit.
+const MAX_PUSH_BYTES: usize = pay_core::sell_inference::MAX_WORKER_PUSH_BYTES;
 const OWNER_TOKEN_PREFIX: &str = "pso_";
 
-/// Who may create endpoints: the bearer of a connector or CLI token.
+/// Who may create endpoints: the bearer of a connector or CLI token whose
+/// account has a wallet. Endpoint slots are shared by every seller, so they
+/// go to accounts, never to identities anyone can mint, like a guest's.
 pub trait CreatorAuth: Send + Sync {
-    fn authenticate(&self, bearer: &str) -> Option<Creator>;
+    fn authenticate(&self, bearer: &str) -> Result<Creator, CreatorError>;
 }
 
-/// An authenticated creator and, when known, the wallet to pay by default.
+/// An authenticated creator with a wallet, the default payee.
 #[derive(Debug, Clone)]
 pub struct Creator {
     pub subject: String,
-    pub wallet: Option<String>,
+    pub wallet: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatorError {
+    /// No such token.
+    Unauthenticated,
+    /// A real token for an account with no wallet yet (a guest).
+    NoWallet,
+}
+
+impl From<CreatorError> for ApiError {
+    fn from(error: CreatorError) -> Self {
+        match error {
+            CreatorError::Unauthenticated => unauthorized(),
+            CreatorError::NoWallet => ApiError::new(
+                StatusCode::FORBIDDEN,
+                "wallet_required",
+                "Sign in with a pay wallet to sell; guest connections cannot create endpoints.",
+            ),
+        }
+    }
 }
 
 /// Shared state of the sell routes.
@@ -107,11 +134,19 @@ impl EndpointRegistry {
         self.lock().get(id).cloned()
     }
 
-    fn insert(&self, entry: Arc<EndpointEntry>) -> Result<(), ApiError> {
-        let mut endpoints = self.lock();
+    /// Whether `owner` may add an endpoint now. Checked before building
+    /// one, and again, atomically, by [`Self::insert`].
+    fn admits(&self, owner: &str) -> Result<(), ApiError> {
+        Self::room_for(&self.lock(), owner)
+    }
+
+    fn room_for(
+        endpoints: &HashMap<String, Arc<EndpointEntry>>,
+        owner: &str,
+    ) -> Result<(), ApiError> {
         if let Some(open) = endpoints
             .values()
-            .find(|e| e.owner == entry.owner && !e.is_closed())
+            .find(|e| e.owner == owner && !e.is_closed())
         {
             // One open endpoint per seller bounds what the platform fronts.
             return Err(ApiError::new(
@@ -131,6 +166,12 @@ impl EndpointRegistry {
                 "This server holds as many endpoints as it can; try again later.",
             ));
         }
+        Ok(())
+    }
+
+    fn insert(&self, entry: Arc<EndpointEntry>) -> Result<(), ApiError> {
+        let mut endpoints = self.lock();
+        Self::room_for(&endpoints, &entry.owner)?;
         endpoints.insert(entry.id.clone(), entry);
         Ok(())
     }
@@ -546,9 +587,11 @@ pub struct NextRequest {
     pub body: Value,
 }
 
+/// Chunks stay raw: they are relayed verbatim, never inspected.
 #[derive(Debug, Deserialize)]
-pub struct PushChunks {
-    pub chunks: Vec<Value>,
+pub struct PushChunks<'a> {
+    #[serde(borrow)]
+    pub chunks: Vec<&'a serde_json::value::RawValue>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -571,12 +614,21 @@ pub struct Fail {
 /// Seller and buyer routes.
 pub fn router(state: Arc<SellState>) -> Router {
     Router::new()
-        .route("/v1/endpoints", post(create))
-        .route("/v1/endpoints/{id}", get(view).patch(update).delete(delete))
+        .route(
+            "/v1/endpoints",
+            post(create).layer(DefaultBodyLimit::max(MAX_TERMS_BYTES)),
+        )
+        .route(
+            "/v1/endpoints/{id}",
+            get(view)
+                .patch(update)
+                .delete(delete)
+                .layer(DefaultBodyLimit::max(MAX_TERMS_BYTES)),
+        )
         .route("/v1/endpoints/{id}/queue/next", get(next_request))
         .route(
             "/v1/endpoints/{id}/requests/{request}/chunks",
-            post(push_chunks),
+            post(push_chunks).layer(DefaultBodyLimit::max(MAX_PUSH_BYTES)),
         )
         .route(
             "/v1/endpoints/{id}/requests/{request}/complete",
@@ -686,9 +738,9 @@ async fn create(
     headers: HeaderMap,
     Json(input): Json<CreateEndpoint>,
 ) -> Result<(StatusCode, Json<EndpointView>), ApiError> {
-    let creator = bearer(&headers)
-        .and_then(|token| state.creators.authenticate(token))
-        .ok_or_else(unauthorized)?;
+    let token = bearer(&headers).ok_or_else(unauthorized)?;
+    let creator = state.creators.authenticate(token)?;
+    state.registry.admits(&creator.subject)?;
     if !input.earn_cap_usd.is_finite()
         || input.earn_cap_usd < MIN_EARN_CAP_USD
         || input.earn_cap_usd > MAX_EARN_CAP_USD
@@ -701,12 +753,7 @@ async fn create(
             ),
         ));
     }
-    let recipient = input.recipient.or(creator.wallet).ok_or_else(|| {
-        ApiError::bad_request(
-            "recipient_required",
-            "Pass `recipient`, or connect a wallet so the endpoint can pay you.",
-        )
-    })?;
+    let recipient = input.recipient.unwrap_or(creator.wallet);
     let id = uuid::Uuid::new_v4().to_string();
     let model = input.model.trim().to_string();
     let sale = SellInference {
@@ -856,6 +903,16 @@ fn queue_error(error: QueueError) -> ApiError {
             "queue_full",
             error.to_string(),
         ),
+        QueueError::Backlogged => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "buyer_backlogged",
+            error.to_string(),
+        ),
+        QueueError::TooLarge => ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "push_too_large",
+            error.to_string(),
+        ),
     }
 }
 
@@ -863,12 +920,14 @@ async fn push_chunks(
     State(state): State<Arc<SellState>>,
     Path((id, request)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(input): Json<PushChunks>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let entry = owned(&state, &id, &headers)?;
+    let input: PushChunks<'_> = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request("invalid_chunks", e.to_string()))?;
     entry
         .queue
-        .push(&request, input.chunks)
+        .push(&request, &input.chunks)
         .map_err(queue_error)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -971,7 +1030,17 @@ async fn dispatch(
                 );
             }
         };
-        let admission = match admission_for(&live.sale, &body) {
+        let head = match ChatHead::parse(&body) {
+            Ok(head) => head,
+            Err(error) => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    &format!("invalid request body: {error}"),
+                );
+            }
+        };
+        let admission = match admission_for(&live.sale, &head) {
             Ok(admission) => admission,
             Err(error) => {
                 return openai_error(
@@ -981,10 +1050,7 @@ async fn dispatch(
                 );
             }
         };
-        streaming = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|body| body.get("stream").and_then(Value::as_bool))
-            .unwrap_or(false);
+        streaming = head.stream;
         if !entry.try_reserve(admission.expected_usd) {
             return openai_error(
                 StatusCode::GONE,
@@ -1035,25 +1101,112 @@ async fn models(State(state): State<Arc<BuyerState>>) -> Json<Value> {
     }))
 }
 
-/// Park the request and relay the worker's answer.
-fn admission_for(sale: &SellInference, body: &[u8]) -> Result<Admission, serde_json::Error> {
-    let json = serde_json::from_slice::<Value>(body)?;
-    let model = json
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+/// The fields of a chat request read before it is paid for. Everything
+/// else (`messages` above all) is skipped by the parser, never built, so an
+/// unpaid body costs its own bytes and no more. Fields read as
+/// `Value::get(..).and_then(Value::as_*)` would: a wrong type is absent,
+/// and a repeated key keeps its last value.
+#[derive(Debug, Default, PartialEq)]
+struct ChatHead {
+    model: Option<String>,
+    stream: bool,
+}
+
+impl ChatHead {
+    fn parse(body: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(body)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatHead {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Head;
+        impl<'de> serde::de::Visitor<'de> for Head {
+            type Value = ChatHead;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a chat completion request object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ChatHead, A::Error> {
+                let mut head = ChatHead::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match (key.as_ref(), map.next_value::<Scalar>()?) {
+                        ("model", Scalar::Str(model)) => head.model = Some(model),
+                        ("model", _) => head.model = None,
+                        ("stream", Scalar::Bool(stream)) => head.stream = stream,
+                        ("stream", _) => head.stream = false,
+                        _ => {}
+                    }
+                }
+                Ok(head)
+            }
+        }
+        deserializer.deserialize_map(Head)
+    }
+}
+
+/// A JSON value kept only if it is a string or a bool; arrays and objects
+/// are walked and dropped.
+enum Scalar {
+    Str(String),
+    Bool(bool),
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess};
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Scalar;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Scalar, E> {
+                Ok(Scalar::Str(v.to_string()))
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Scalar, E> {
+                Ok(Scalar::Bool(v))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Scalar, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Scalar::Other)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Scalar, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Scalar::Other)
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// The terms a request is admitted under.
+fn admission_for(sale: &SellInference, head: &ChatHead) -> Result<Admission, &'static str> {
     // The gate prices this exact model string; never let accounting resolve
     // a different rate for a whitespace variant of it.
-    if model.as_deref().is_some_and(|m| m.trim() != m) {
-        return Err(serde::de::Error::custom(
-            "model must not have leading or trailing whitespace",
-        ));
+    if head.model.as_deref().is_some_and(|m| m.trim() != m) {
+        return Err("model must not have leading or trailing whitespace");
     }
     let pricing = sale.pricing.clone();
     Ok(Admission {
         expected_usd: pricing.max_usd(),
         pricing,
-        model,
+        model: head.model.clone(),
     })
 }
 
@@ -1073,8 +1226,8 @@ async fn chat_completions(
             "This endpoint is no longer available.",
         );
     };
-    let stream = match serde_json::from_slice::<Value>(&body) {
-        Ok(json) => json.get("stream").and_then(Value::as_bool).unwrap_or(false),
+    let head = match ChatHead::parse(&body) {
+        Ok(head) => head,
         Err(e) => {
             return openai_error(
                 StatusCode::BAD_REQUEST,
@@ -1083,13 +1236,14 @@ async fn chat_completions(
             );
         }
     };
+    let stream = head.stream;
     let admission = match reserved {
         Some(Extension(reserved)) => {
             reserved.claimed.store(true, Ordering::Release);
             reserved.admission
         }
         None => {
-            let admission = match admission_for(&state.sale, &body) {
+            let admission = match admission_for(&state.sale, &head) {
                 Ok(admission) => admission,
                 Err(error) => {
                     return openai_error(
@@ -1235,7 +1389,7 @@ fn stream_response(rx: mpsc::UnboundedReceiver<Event>, guard: ClaimedRequestGuar
             let (mut rx, guard) = state?;
             let (frame, next) = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
                 Ok(Some(Event::Claimed)) => (Bytes::new(), Some((rx, guard))),
-                Ok(Some(Event::Chunk(chunk))) => (sse(&chunk), Some((rx, guard))),
+                Ok(Some(Event::Chunk(frame))) => (frame.into_bytes(), Some((rx, guard))),
                 Ok(Some(Event::Complete(Some(last)))) => {
                     signal.complete();
                     let mut frame = sse(&last).to_vec();
@@ -1302,17 +1456,14 @@ mod tests {
     struct FixedCreators;
 
     impl CreatorAuth for FixedCreators {
-        fn authenticate(&self, bearer: &str) -> Option<Creator> {
+        fn authenticate(&self, bearer: &str) -> Result<Creator, CreatorError> {
             match bearer {
-                "creator" => Some(Creator {
+                "creator" => Ok(Creator {
                     subject: "sub_creator".into(),
-                    wallet: Some(CREATOR_WALLET.into()),
+                    wallet: CREATOR_WALLET.into(),
                 }),
-                "guest" => Some(Creator {
-                    subject: "guest_1".into(),
-                    wallet: None,
-                }),
-                _ => None,
+                "guest" => Err(CreatorError::NoWallet),
+                _ => Err(CreatorError::Unauthenticated),
             }
         }
     }
@@ -1417,17 +1568,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
-        // A guest has no wallet and names no recipient.
+        // A guest holds no endpoint slot, even naming a payee.
+        let mut guest = per_request(0.02);
+        guest["recipient"] = json!(CREATOR_WALLET);
         let (status, _, body) = send(
             &app,
             Method::POST,
             "/v1/endpoints",
             Some("guest"),
-            Some(per_request(0.02)),
+            Some(guest),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["error"], "recipient_required");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "wallet_required");
+        assert!(state.registry.is_empty());
 
         let (status, _, view) = send(
             &app,
@@ -2302,6 +2456,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_buyer_that_stops_reading_backpressures_the_worker() {
+        let state = state();
+        let app = router(state.clone());
+        let (id, token) = create_endpoint(&app, per_request(0.02)).await;
+        let buyer = tokio::spawn(buyer(
+            &state,
+            &id,
+            json!({ "model": "agent", "stream": true, "messages": [] }),
+        ));
+        let (_, _, next) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}/queue/next?wait=5"),
+            Some(&token),
+            None,
+        )
+        .await;
+        let rid = next["request_id"].as_str().unwrap().to_string();
+        let response = buyer.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let path = format!("/v1/endpoints/{id}/requests/{rid}/chunks");
+        let push = |chunks: Value| {
+            send(
+                &app,
+                Method::POST,
+                &path,
+                Some(&token),
+                Some(json!({ "chunks": chunks })),
+            )
+        };
+
+        let chunk = json!({ "choices": [{ "delta": { "content": "x".repeat(100 * 1024) } }] });
+        let mut accepted = 0;
+        let status = loop {
+            let (status, _, body) = push(json!([chunk])).await;
+            if status != StatusCode::ACCEPTED {
+                assert_eq!(body["error"], "buyer_backlogged", "{body}");
+                break status;
+            }
+            accepted += 1;
+            assert!(accepted <= 64, "pushes to an unread stream never stop");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(accepted * 100 * 1024 <= super::super::queue::MAX_BUFFERED_PER_REQUEST);
+
+        // Once the buyer reads, the worker may push again.
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.unwrap().unwrap().starts_with(b"data: "));
+        assert_eq!(push(json!([chunk])).await.0, StatusCode::ACCEPTED);
+
+        // One push is a few chunks, not megabytes of them.
+        let zeros = vec![0; MAX_PUSH_BYTES / 2];
+        assert_eq!(push(json!(zeros)).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_buffered_answer_is_the_completion_object_and_failures_are_errors() {
         let state = state();
         let app = router(state.clone());
@@ -2429,6 +2639,85 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    #[test]
+    fn the_chat_head_reads_model_and_stream_as_the_body_says() {
+        let head = |body: &str| ChatHead::parse(body.as_bytes()).map_err(|e| e.to_string());
+        for body in [
+            r#"{"model":"agent","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"other","stream":false,"model":"agent","stream":true}"#,
+            r#"{"messages":[[1,{"model":"x"}]],"model":"ag\u0065nt","stream":true}"#,
+        ] {
+            let value: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(value["model"], "agent", "{body}");
+            assert_eq!(
+                head(body),
+                Ok(ChatHead {
+                    model: Some("agent".into()),
+                    stream: true,
+                }),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{}"#,
+            r#"{"model":7,"stream":"yes"}"#,
+            r#"{"model":["agent"],"stream":{"on":true}}"#,
+            r#"{"model":"agent","model":null,"stream":true,"stream":1}"#,
+        ] {
+            assert_eq!(head(body), Ok(ChatHead::default()), "{body}");
+        }
+        for body in [
+            "",
+            "[]",
+            r#"["agent",true]"#,
+            r#"{"model":"agent"} x"#,
+            "{\"a\":[0,]}",
+        ] {
+            assert!(head(body).is_err(), "{body}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn endpoint_terms_are_small_and_currencies_a_set() {
+        let state = state();
+        let app = router(state.clone());
+        let create = |currencies: Value| {
+            let mut body = per_request(0.02);
+            body["currencies"] = currencies;
+            send(
+                &app,
+                Method::POST,
+                "/v1/endpoints",
+                Some("creator"),
+                Some(body),
+            )
+        };
+
+        let (status, _, err) = create(json!(["USDC", "usdc"])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(err.to_string().contains("more than once"), "{err}");
+        let (status, _, _) = create(json!(vec!["USDC"; 20_000])).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(state.registry.is_empty());
+
+        let (status, _, view) = create(json!(["USDC", "USDT"])).await;
+        assert_eq!(status, StatusCode::CREATED, "{view}");
+        assert_eq!(view["currencies"], json!(["USDC", "USDT"]));
+        let mut models = serde_json::Map::new();
+        for i in 0..5_000 {
+            models.insert(format!("model-{i}"), json!({ "in": 1.0, "out": 1.0 }));
+        }
+        let (status, _, _) = send(
+            &app,
+            Method::PATCH,
+            &format!("/v1/endpoints/{}", view["id"].as_str().unwrap()),
+            Some(view["owner_token"].as_str().unwrap()),
+            Some(json!({ "pricing": { "per_token": { "models": models, "max_usd": 0.1 } } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_earn_cap_is_required_bounded_and_one_endpoint_per_seller() {
         let state = state();
@@ -2467,6 +2756,18 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{err}");
         assert_eq!(err["error"], "endpoint_exists");
         assert_eq!(err["details"]["endpoint_id"], id);
+        // The slot is checked before anything is built for the endpoint.
+        let mut unbuildable = per_request(0.02);
+        unbuildable["currencies"] = json!(["NOPE"]);
+        let (status, _, err) = send(
+            &app,
+            Method::POST,
+            "/v1/endpoints",
+            Some("creator"),
+            Some(unbuildable),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
 
         // Stopping frees the slot.
         send(
@@ -2486,6 +2787,36 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// Every sponsored session open fronts operator rent until the channel
+    /// closes; a seller cannot stretch the close or shrink the deposit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_terms_that_lock_operator_rent_are_refused() {
+        let state = state();
+        let app = router(state.clone());
+        for (field, value) in [
+            ("session_idle_close_secs", json!(2_592_000)),
+            ("session_cap_usd", json!(0.000_001)),
+        ] {
+            let mut body = per_request(0.02);
+            body[field] = value;
+            let (status, _, err) = send(
+                &app,
+                Method::POST,
+                "/v1/endpoints",
+                Some("creator"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+            assert!(err.to_string().contains(field), "{err}");
+        }
+
+        let mut body = per_request(0.02);
+        body["session_idle_close_secs"] = json!(3_600);
+        body["session_cap_usd"] = json!(1.0);
+        create_endpoint(&app, body).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

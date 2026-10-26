@@ -22,6 +22,8 @@ use axum::routing::{get, post};
 use serde_json::json;
 
 #[cfg(feature = "mcp")]
+mod capacity;
+#[cfg(feature = "mcp")]
 pub mod cli;
 #[cfg(feature = "mcp")]
 pub mod hosts;
@@ -137,11 +139,13 @@ impl WalletProbe for PayApiProbe {
 
 #[cfg(all(feature = "mcp", feature = "privy"))]
 fn default_spend_history() -> Arc<dyn tenants::SpendHistory> {
-    Arc::new(privy::OnChainSpendHistory::new(
+    // The public RPC rate-limits a history scan within a dozen reads.
+    let rpc = pay_core::config::payment_rpc_url().unwrap_or_else(|| {
         pay_core::client::subscription::default_rpc_url_for_network(
             pay_core::accounts::MAINNET_NETWORK,
-        ),
-    ))
+        )
+    });
+    Arc::new(privy::OnChainSpendHistory::new(rpc))
 }
 
 /// Without Privy no wallet is ever bound, so nothing is read.
@@ -375,7 +379,12 @@ pub fn router(state: AppState) -> Router {
             "/.well-known/oauth-protected-resource/mcp",
             get(oauth::protected_resource),
         )
-        .route("/oauth/register", post(oauth::register))
+        .route(
+            "/oauth/register",
+            post(oauth::register).layer(axum::extract::DefaultBodyLimit::max(
+                oauth::MAX_REGISTRATION_BYTES,
+            )),
+        )
         .route("/oauth/authorize", get(oauth::authorize))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
@@ -473,7 +482,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Who may create a `sell_inference` endpoint: a linked CLI's token, or a
-/// connector bearer. Either way the tenant's wallet is the default payee.
+/// connector bearer, of a tenant with a wallet, its default payee.
 #[cfg(feature = "sell")]
 struct Creators {
     cli: Arc<cli::Store>,
@@ -483,17 +492,22 @@ struct Creators {
 
 #[cfg(feature = "sell")]
 impl sell::routes::CreatorAuth for Creators {
-    fn authenticate(&self, bearer: &str) -> Option<sell::routes::Creator> {
+    fn authenticate(
+        &self,
+        bearer: &str,
+    ) -> Result<sell::routes::Creator, sell::routes::CreatorError> {
         let subject = self
             .cli
             .authenticate(bearer)
-            .or_else(|| self.mcp.as_ref()?.authenticate(bearer).map(|t| t.id))?;
+            .or_else(|| self.mcp.as_ref()?.authenticate(bearer).map(|t| t.id))
+            .ok_or(sell::routes::CreatorError::Unauthenticated)?;
         let wallet = self
             .tenants
             .get(&subject)
-            .filter(|t| !t.pubkey.is_empty())
-            .map(|t| t.pubkey.clone());
-        Some(sell::routes::Creator { subject, wallet })
+            .map(|t| t.pubkey.clone())
+            .filter(|pubkey| !pubkey.is_empty())
+            .ok_or(sell::routes::CreatorError::NoWallet)?;
+        Ok(sell::routes::Creator { subject, wallet })
     }
 }
 

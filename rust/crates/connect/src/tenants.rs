@@ -37,8 +37,27 @@ pub const CONNECTOR_ACCOUNT: &str = "connector";
 
 /// How long a wallet-link ticket handed to a guest stays valid.
 pub const LINK_TTL: Duration = Duration::from_secs(30 * 60);
-/// Most link tickets held at once; expired ones are swept when full.
-const MAX_LINKS: usize = 4096;
+/// Link tickets held at once. An unclaimed ticket is a request anyone can
+/// get again, so a burst of them displaces itself; a claimed one (a link
+/// being completed) is never displaced.
+const LINK_LIMITS: crate::capacity::Limits = crate::capacity::Limits {
+    rows: 4096,
+    per_owner: 1,
+    anonymous: crate::capacity::Anonymous::EvictOldest,
+};
+
+/// Guests one browser remembers approving, newest last.
+const GUESTS_PER_BROWSER: usize = 4;
+
+/// Why a link ticket cannot be used here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRefused {
+    /// Unknown, used, being used, or expired.
+    Unknown,
+    /// Live, but its guest was approved in another browser: whoever sent
+    /// the link would get the wallet.
+    OtherBrowser,
+}
 
 /// Subjects minted for guests: connected, no wallet yet.
 pub const GUEST_PREFIX: &str = "guest_";
@@ -140,12 +159,22 @@ struct LinkTicket {
     claimed: bool,
 }
 
+impl crate::capacity::Row for LinkTicket {
+    fn owner(&self) -> Option<&str> {
+        self.claimed.then_some(self.subject.as_str())
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
+}
+
 /// What a wallet has already paid out, from a record that outlives this
 /// process, so a restart cannot hand out a second daily allowance.
 #[async_trait::async_trait]
 pub trait SpendHistory: Send + Sync {
     /// USD minor units `wallet` paid out in stablecoins during the current
-    /// UTC day. An error means unavailable, and binding fails closed;
+    /// UTC day. An error means unavailable: binding still succeeds, with
+    /// today's allowance held until a later read counts it.
     /// [`UNCOUNTABLE_SPEND`] means binding succeeds with nothing left today.
     async fn spent_today(&self, wallet: &str) -> Result<u64, String>;
 }
@@ -170,10 +199,33 @@ pub struct TenantRegistry {
     tenants: Mutex<HashMap<String, Arc<TenantRecord>>>,
     links: Mutex<HashMap<String, LinkTicket>>,
     provisioning: Mutex<HashSet<String>>,
-    /// Ledger keys whose spend before this process started is recorded.
-    seeded: Mutex<HashSet<String>>,
+    /// Ledger keys whose spend before this process started is accounted for.
+    seeded: Mutex<HashMap<String, Seed>>,
     ledger: Arc<dyn SpendLedger>,
     cookie_key: [u8; 32],
+}
+
+/// How a wallet's spend before this process started is accounted for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seed {
+    /// Read from its history; the in-process ledger covers the rest.
+    Counted,
+    /// History was unavailable: the ledger refuses every reservation, on any
+    /// day, until a later read counts it.
+    Held,
+}
+
+/// What [`TenantRegistry::seed_spend`] did. Neither outcome refuses the
+/// binding: anyone can make a wallet's history unreadable by naming it in
+/// transactions, so an unreadable history withholds spend, not sign-in.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Seeded {
+    Counted,
+    /// Nothing can be spent until a later sign-in reads the history.
+    Held {
+        why: String,
+    },
 }
 
 /// An allowance reservation that is automatically released unless a wallet
@@ -256,24 +308,33 @@ impl TenantRegistry {
 
     /// Record what `tenant`'s wallet already spent today before this process
     /// saw it, once per wallet. The in-process ledger covers the rest.
-    pub async fn seed_spend(
-        &self,
-        tenant: &TenantRecord,
-        history: &dyn SpendHistory,
-    ) -> Result<(), String> {
+    pub async fn seed_spend(&self, tenant: &TenantRecord, history: &dyn SpendHistory) -> Seeded {
         let key = tenant.ledger_key();
-        if self.seeded.lock().unwrap().contains(&key) {
-            return Ok(());
+        if matches!(self.seeded.lock().unwrap().get(&key), Some(Seed::Counted)) {
+            return Seeded::Counted;
         }
-        let mut spent = history.spent_today(&tenant.pubkey).await?;
-        if spent == UNCOUNTABLE_SPEND {
-            // Exactly the cap: nothing more today, and a refusal that reads.
-            spent = tenant.policy.daily_cap.unwrap_or(UNCOUNTABLE_SPEND);
+        let cap = tenant.policy.daily_cap.unwrap_or(UNCOUNTABLE_SPEND);
+        let read = history.spent_today(&tenant.pubkey).await;
+        let mut seeded = self.seeded.lock().unwrap();
+        if seeded.get(&key) == Some(&Seed::Counted) {
+            return Seeded::Counted;
         }
-        if self.seeded.lock().unwrap().insert(key.clone()) {
-            let _ = self.ledger.check_and_record(&key, spent, None);
+        match read {
+            Ok(mut spent) => {
+                if spent == UNCOUNTABLE_SPEND {
+                    // Exactly the cap: nothing more today, and a refusal that reads.
+                    spent = cap;
+                }
+                self.ledger.count(&key, spent);
+                seeded.insert(key, Seed::Counted);
+                Seeded::Counted
+            }
+            Err(why) => {
+                self.ledger.hold(&key);
+                seeded.insert(key, Seed::Held);
+                Seeded::Held { why }
+            }
         }
-        Ok(())
     }
 
     fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
@@ -384,49 +445,106 @@ impl TenantRegistry {
             == Some(crate::protocol::sha256_hex(ticket).as_str())
     }
 
-    /// A fresh ticket for `subject`; `None` when the table is full of live
-    /// tickets. The plaintext goes into the tool error, only its hash stays.
+    /// A fresh ticket for `subject`; `None` while it holds a live one, or
+    /// when the table is full of links being completed. The plaintext goes
+    /// into the tool error, only its hash stays.
     pub fn mint_link(&self, subject: &str) -> Option<String> {
         let ticket = crate::protocol::random_token();
         let now = Instant::now();
         let mut links = self.links.lock().unwrap();
-        links.retain(|_, t| now.saturating_duration_since(t.created_at) <= LINK_TTL);
-        if links.values().any(|ticket| ticket.subject == subject) {
+        let expired = |t: &LinkTicket| now.saturating_duration_since(t.created_at) > LINK_TTL;
+        if links
+            .values()
+            .any(|ticket| ticket.subject == subject && !expired(ticket))
+        {
             return None;
         }
-        if links.len() >= MAX_LINKS {
-            return None;
-        }
-        links.insert(
+        let row = LinkTicket {
+            subject: subject.to_string(),
+            created_at: now,
+            claimed: false,
+        };
+        crate::capacity::admit(
+            &mut links,
             crate::protocol::sha256_hex(&ticket),
-            LinkTicket {
-                subject: subject.to_string(),
-                created_at: now,
-                claimed: false,
-            },
-        );
+            row,
+            LINK_LIMITS,
+            expired,
+        )
+        .ok()?;
         Some(ticket)
     }
 
-    /// The subject a live ticket is for, without consuming it.
-    pub fn peek_link(&self, ticket: &str) -> Option<String> {
-        let links = self.links.lock().unwrap();
-        let t = links.get(&crate::protocol::sha256_hex(ticket))?;
-        (!t.claimed && Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL)
-            .then(|| t.subject.clone())
+    /// Remember that this browser approved guest `subject`, beside the
+    /// last few guests it approved before: only this browser can later
+    /// attach a wallet to that guest's connection.
+    pub fn guest_cookie(
+        &self,
+        headers: &axum::http::HeaderMap,
+        subject: &str,
+        secure: bool,
+    ) -> axum::http::HeaderValue {
+        let mut guests = self.guests_from_cookie(headers);
+        guests.retain(|guest| guest != subject);
+        guests.push(subject.to_string());
+        let keep = guests.len().saturating_sub(GUESTS_PER_BROWSER);
+        cookie::set(
+            cookie::GUEST_NAME,
+            &self.sign_cookie_value(b"guest", &guests[keep..].join("~")),
+            secure,
+        )
     }
 
-    /// Reserve a live ticket before external provisioning. Dropping the
-    /// claim releases it for a retry; committing consumes it.
-    pub(crate) fn claim_link<'a>(&'a self, ticket: &str) -> Option<LinkClaim<'a>> {
+    fn guests_from_cookie(&self, headers: &axum::http::HeaderMap) -> Vec<String> {
+        cookie::value(headers, cookie::GUEST_NAME)
+            .and_then(|signed| self.verify_cookie_value(b"guest", &signed))
+            .map(|value| value.split('~').map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The subject a live ticket is for, without consuming it, when this
+    /// browser is the one that approved that guest.
+    pub fn peek_link(
+        &self,
+        ticket: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<String, LinkRefused> {
+        let subject = {
+            let links = self.links.lock().unwrap();
+            let t = links
+                .get(&crate::protocol::sha256_hex(ticket))
+                .ok_or(LinkRefused::Unknown)?;
+            if t.claimed || Instant::now().saturating_duration_since(t.created_at) > LINK_TTL {
+                return Err(LinkRefused::Unknown);
+            }
+            t.subject.clone()
+        };
+        self.guests_from_cookie(headers)
+            .contains(&subject)
+            .then_some(subject)
+            .ok_or(LinkRefused::OtherBrowser)
+    }
+
+    /// Reserve a live ticket before external provisioning, when this
+    /// browser approved its guest. Dropping the claim releases it for a
+    /// retry; committing consumes it.
+    pub(crate) fn claim_link<'a>(
+        &'a self,
+        ticket: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<LinkClaim<'a>, LinkRefused> {
+        let guests = self.guests_from_cookie(headers);
         let key = crate::protocol::sha256_hex(ticket);
         let mut links = self.links.lock().unwrap();
-        let entry = links.get_mut(&key)?;
+        let entry = links.get_mut(&key).ok_or(LinkRefused::Unknown)?;
         if entry.claimed || Instant::now().saturating_duration_since(entry.created_at) > LINK_TTL {
-            return None;
+            return Err(LinkRefused::Unknown);
+        }
+        if !guests.contains(&entry.subject) {
+            return Err(LinkRefused::OtherBrowser);
         }
         entry.claimed = true;
-        Some(LinkClaim {
+        Ok(LinkClaim {
             registry: self,
             key,
             subject: entry.subject.clone(),
@@ -610,6 +728,7 @@ pub mod cookie {
 
     pub const SUBJECT_NAME: &str = "pay_subject";
     pub const LINK_NAME: &str = "pay_link";
+    pub const GUEST_NAME: &str = "pay_guest";
     const ONE_YEAR: u64 = 365 * 24 * 60 * 60;
 
     /// The subject the request's cookie names, if any.
@@ -737,8 +856,9 @@ impl PayContext for CloudContext {
             // Fail closed on challenge-selected terms: mainnet stablecoins
             // only, before any payment is built or signed.
             payment_permissions: Some(Arc::new(record.payment_permissions())),
-            // The server has no access to the caller's files.
-            body_files: false,
+            // The server has no access to the caller's files, and must not
+            // leave tenant response artefacts on its own disk.
+            local_files: None,
             // Arbitrary public APIs remain available, but tenant-controlled
             // requests cannot reach Cloud Run metadata, loopback, or private
             // services from this privileged process.
@@ -939,21 +1059,92 @@ mod tests {
         assert!(registry.update_credentials("sub_x", |_| {}).is_none());
     }
 
+    /// The headers of a browser holding `registry`'s guest cookie for
+    /// `subjects`, approved in that order.
+    fn browser_of(registry: &TenantRegistry, subjects: &[&str]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for subject in subjects {
+            let set = registry.guest_cookie(&headers, subject, true);
+            let pair = set.to_str().unwrap().split(';').next().unwrap().to_string();
+            headers.insert(axum::http::header::COOKIE, pair.parse().unwrap());
+        }
+        headers
+    }
+
     #[test]
     fn link_tickets_are_single_use_and_name_their_subject() {
         let registry = TenantRegistry::new();
+        let browser = browser_of(&registry, &["guest_1"]);
         let ticket = registry.mint_link("guest_1").unwrap();
         assert!(ticket.len() >= 32);
-        assert_eq!(registry.peek_link(&ticket).as_deref(), Some("guest_1"));
-        let claim = registry.claim_link(&ticket).unwrap();
+        assert_eq!(
+            registry.peek_link(&ticket, &browser).as_deref(),
+            Ok("guest_1")
+        );
+        let claim = registry.claim_link(&ticket, &browser).unwrap();
         assert_eq!(claim.subject(), "guest_1");
-        assert!(registry.peek_link(&ticket).is_none(), "claimed");
+        assert_eq!(
+            registry.peek_link(&ticket, &browser),
+            Err(LinkRefused::Unknown),
+            "claimed"
+        );
         drop(claim);
-        assert!(registry.peek_link(&ticket).is_some(), "released for retry");
-        registry.claim_link(&ticket).unwrap().commit();
-        assert!(registry.peek_link(&ticket).is_none(), "consumed");
-        assert!(registry.claim_link("nope").is_none());
+        assert!(
+            registry.peek_link(&ticket, &browser).is_ok(),
+            "released for retry"
+        );
+        registry.claim_link(&ticket, &browser).unwrap().commit();
+        assert_eq!(
+            registry.peek_link(&ticket, &browser),
+            Err(LinkRefused::Unknown),
+            "consumed"
+        );
+        assert!(registry.claim_link("nope", &browser).is_err());
         assert!(is_guest("guest_abc") && !is_guest("sub_abc"));
+    }
+
+    /// connect/07: a ticket is good only in the browser that approved its
+    /// guest, so whoever forwards it cannot have someone else link a wallet.
+    #[test]
+    fn a_link_ticket_works_only_in_the_guests_own_browser() {
+        let registry = TenantRegistry::new();
+        let ticket = registry.mint_link("guest_attacker").unwrap();
+        let victim = browser_of(&registry, &["guest_victim"]);
+        for headers in [axum::http::HeaderMap::new(), victim] {
+            assert_eq!(
+                registry.peek_link(&ticket, &headers),
+                Err(LinkRefused::OtherBrowser)
+            );
+            assert!(matches!(
+                registry.claim_link(&ticket, &headers),
+                Err(LinkRefused::OtherBrowser)
+            ));
+        }
+        // A forged cookie naming the guest proves nothing.
+        let mut forged = axum::http::HeaderMap::new();
+        forged.insert(
+            axum::http::header::COOKIE,
+            "pay_guest=guest_attacker.00".parse().unwrap(),
+        );
+        assert_eq!(
+            registry.peek_link(&ticket, &forged),
+            Err(LinkRefused::OtherBrowser)
+        );
+
+        // Control: the approving browser links, among its last few guests.
+        let own = browser_of(
+            &registry,
+            &["guest_attacker", "guest_2", "guest_3", "guest_4"],
+        );
+        assert!(registry.claim_link(&ticket, &own).is_ok());
+        let one_too_many = browser_of(
+            &registry,
+            &["guest_attacker", "guest_2", "guest_3", "guest_4", "guest_5"],
+        );
+        assert_eq!(
+            registry.guests_from_cookie(&one_too_many),
+            ["guest_2", "guest_3", "guest_4", "guest_5"]
+        );
     }
 
     #[test]
@@ -962,6 +1153,32 @@ mod tests {
         assert!(registry.mint_link("guest_1").is_some());
         assert!(registry.mint_link("guest_1").is_none());
         assert!(registry.mint_link("guest_2").is_some());
+    }
+
+    /// connect/06: a burst of guest tickets displaces itself instead of
+    /// leaving later guests with no link, and never a link being completed.
+    #[test]
+    fn a_burst_of_link_tickets_cannot_lock_out_other_guests() {
+        let registry = TenantRegistry::new();
+        let browser = browser_of(&registry, &["guest_linking", "guest_first", "guest_late"]);
+        let claimed = registry.mint_link("guest_linking").unwrap();
+        let claim = registry.claim_link(&claimed, &browser).unwrap();
+        let first = registry.mint_link("guest_first").unwrap();
+        for i in 0..LINK_LIMITS.rows {
+            registry.mint_link(&format!("guest_burst_{i}")).unwrap();
+        }
+        let late = registry.mint_link("guest_late").expect("room is made");
+        assert_eq!(
+            registry.peek_link(&late, &browser).as_deref(),
+            Ok("guest_late")
+        );
+        assert_eq!(
+            registry.peek_link(&first, &browser),
+            Err(LinkRefused::Unknown),
+            "the oldest went"
+        );
+        claim.commit();
+        assert_eq!(registry.links.lock().unwrap().len(), LINK_LIMITS.rows - 1);
     }
 
     #[test]
@@ -1056,21 +1273,21 @@ mod tests {
 
         // After it: the chain says $5 left the wallet today.
         let after = TenantRegistry::new();
-        after
-            .seed_spend(&tenant, &FixedHistory(50_000))
-            .await
-            .unwrap();
+        assert_eq!(
+            after.seed_spend(&tenant, &FixedHistory(50_000)).await,
+            Seeded::Counted
+        );
         assert!(after.reserve_cli_transaction(&tenant, 1).is_err());
         // Seeding happens once; a later login does not double count.
         let partial = TenantRegistry::new();
-        partial
-            .seed_spend(&tenant, &FixedHistory(30_000))
-            .await
-            .unwrap();
-        partial
-            .seed_spend(&tenant, &FixedHistory(30_000))
-            .await
-            .unwrap();
+        assert_eq!(
+            partial.seed_spend(&tenant, &FixedHistory(30_000)).await,
+            Seeded::Counted
+        );
+        assert_eq!(
+            partial.seed_spend(&tenant, &FixedHistory(30_000)).await,
+            Seeded::Counted
+        );
         partial
             .reserve_cli_transaction(&tenant, 10_000)
             .unwrap()
@@ -1083,7 +1300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_history_seeds_nothing_and_retries() {
+    async fn an_unknown_history_holds_the_day_and_retries() {
         struct Down;
         #[async_trait::async_trait]
         impl SpendHistory for Down {
@@ -1093,12 +1310,73 @@ mod tests {
         }
         let registry = TenantRegistry::new();
         let tenant = record("sub_1");
-        assert!(registry.seed_spend(&tenant, &Down).await.is_err());
-        registry
-            .seed_spend(&tenant, &FixedHistory(50_000))
-            .await
-            .unwrap();
+        // Unreadable history binds, but nothing can be spent on it.
+        assert!(matches!(
+            registry.seed_spend(&tenant, &Down).await,
+            Seeded::Held { .. }
+        ));
         assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        assert!(matches!(
+            registry.seed_spend(&tenant, &Down).await,
+            Seeded::Held { .. }
+        ));
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        // A later read replaces the hold with the real count.
+        assert_eq!(
+            registry.seed_spend(&tenant, &FixedHistory(30_000)).await,
+            Seeded::Counted
+        );
+        for _ in 0..2 {
+            registry
+                .reserve_cli_transaction(&tenant, 10_000)
+                .unwrap()
+                .commit();
+        }
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        // Counted once: a later outage changes nothing.
+        assert_eq!(registry.seed_spend(&tenant, &Down).await, Seeded::Counted);
+    }
+
+    #[tokio::test]
+    async fn a_held_wallet_stays_held_across_midnight() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Down;
+        #[async_trait::async_trait]
+        impl SpendHistory for Down {
+            async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+                Err("rpc down".into())
+            }
+        }
+        let day = Arc::new(AtomicU64::new(100));
+        let clock_day = day.clone();
+        let ledger = Arc::new(MemoryLedger::with_clock(Arc::new(move || {
+            clock_day.load(Ordering::SeqCst)
+        })));
+        let registry = TenantRegistry::with_ledger(ledger);
+        let mut tenant = record("sub_1");
+        tenant.policy = SpendPolicy {
+            per_call_ceiling: Some(50_000),
+            daily_cap: Some(50_000),
+        };
+        assert!(matches!(
+            registry.seed_spend(&tenant, &Down).await,
+            Seeded::Held { .. }
+        ));
+
+        // A new day does not reset an unknown history into a full allowance.
+        day.store(101, Ordering::SeqCst);
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+
+        // Only a read lifts it, and what it counted applies at once.
+        assert_eq!(
+            registry.seed_spend(&tenant, &FixedHistory(40_000)).await,
+            Seeded::Counted
+        );
+        assert!(registry.reserve_cli_transaction(&tenant, 20_000).is_err());
+        registry
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
     }
 
     #[test]

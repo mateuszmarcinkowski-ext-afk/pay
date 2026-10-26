@@ -39,6 +39,8 @@ pub const MODELS_PATH: &str = "v1/models";
 pub const USAGE_PRESET: &str = "openai-compatible";
 /// Upper bound on a buffered response body for usage extraction.
 pub const RESPONSE_BODY_LIMIT: usize = 32 * 1024 * 1024;
+/// Largest body a seller's worker may send pay-connect in one chunk push.
+pub const MAX_WORKER_PUSH_BYTES: usize = 256 * 1024;
 
 const TOKENS_PER_SCALE: u64 = 1_000_000;
 const PROMPT_TOKENS_PATH: &str = "/usage/prompt_tokens";
@@ -141,6 +143,34 @@ pub struct SellInference {
 
 /// Default [`SellInference::session_idle_close_secs`]: ten minutes.
 pub const DEFAULT_SESSION_IDLE_CLOSE_SECS: u32 = 600;
+/// Longest [`SellInference::session_idle_close_secs`]. The operator fronts
+/// each channel's rent until it closes, so a seller cannot hold it longer.
+pub const MAX_SESSION_IDLE_CLOSE_SECS: u32 = 3_600;
+/// Least [`SellInference::session_cap_usd`], which is also the minimum
+/// deposit: a sponsored open must lock at least about the rent it fronts.
+pub const MIN_SESSION_CAP_USD: f64 = 1.0;
+
+/// Least unsettled amount the operator settles on-chain before a channel
+/// closes: $0.01 in a 6-decimal stablecoin. The operator pays every settle
+/// and earns nothing on the channel, so smaller advances wait for the close.
+pub const SESSION_MIN_SETTLE_BASE_UNITS: u64 = 10_000;
+
+/// How the embedded lifecycle pushes a sell session's watermarks on-chain.
+#[cfg(feature = "server")]
+pub fn session_watermark_settlement(
+    spec: &SessionSpec,
+) -> crate::server::session::WatermarkSettlement {
+    use crate::server::session::{MinSettleDelta, WatermarkSettlement};
+    const MIN: std::num::NonZeroU64 = match std::num::NonZeroU64::new(SESSION_MIN_SETTLE_BASE_UNITS)
+    {
+        Some(min) => min,
+        None => panic!("the sell settle minimum is positive"),
+    };
+    WatermarkSettlement::every(
+        std::time::Duration::from_millis(spec.settlement_interval_ms),
+        MinSettleDelta::new(MIN),
+    )
+}
 
 impl SellInference {
     /// `endpoints/<id>`.
@@ -170,12 +200,36 @@ impl SellInference {
         if self.currencies.is_empty() {
             errs.push("at least one currency is required".into());
         }
+        // Each currency gets its own backends, so the list is a set of
+        // supported stablecoins: at most one entry each.
+        let mut seen = Vec::with_capacity(pay_types::Stablecoin::ALL.len());
+        for symbol in &self.currencies {
+            match pay_types::Stablecoin::parse_symbol(symbol) {
+                None => {
+                    errs.push(format!("unsupported currency `{symbol}`"));
+                    break;
+                }
+                Some(coin) if seen.contains(&coin) => {
+                    errs.push(format!("currency {coin} is listed more than once"));
+                    break;
+                }
+                Some(coin) => seen.push(coin),
+            }
+        }
         if self.model.is_empty() {
             errs.push("model is required".into());
         }
-        check_positive("session_cap_usd", self.session_cap_usd, &mut errs);
-        if self.session_idle_close_secs == 0 {
-            errs.push("session_idle_close_secs must be at least 1".into());
+        if !self.session_cap_usd.is_finite() || self.session_cap_usd < MIN_SESSION_CAP_USD {
+            errs.push(format!(
+                "session_cap_usd must be at least {MIN_SESSION_CAP_USD} USD, got {}",
+                self.session_cap_usd
+            ));
+        }
+        if !(1..=MAX_SESSION_IDLE_CLOSE_SECS).contains(&self.session_idle_close_secs) {
+            errs.push(format!(
+                "session_idle_close_secs must be between 1 and {MAX_SESSION_IDLE_CLOSE_SECS}, got {}",
+                self.session_idle_close_secs
+            ));
         }
         self.pricing.validate(&mut errs);
         if errs.is_empty() {
@@ -242,13 +296,14 @@ impl SellInference {
             }),
             recipients: HashMap::new(),
             session: schemes.contains(&Scheme::MppSession).then(|| {
-                let idle_close_secs = self.session_idle_close_secs.max(1);
+                let idle_close_secs = self
+                    .session_idle_close_secs
+                    .clamp(1, MAX_SESSION_IDLE_CLOSE_SECS);
                 let close_delay_ms = u64::from(idle_close_secs) * 1_000;
-                // Buyers pick how long their channel may idle, up to a day. A
-                // buyer's choice is honored even when the seller's idle close
-                // is shorter, so the seller's value leads the list: clients
-                // that take the first option close on the seller's schedule.
-                let mut idle_options = vec![idle_close_secs, 300, 600, 1800, 3600, 21600, 86400];
+                // Buyers may pick a shorter idle close; the seller's value is
+                // the longest offered and the default.
+                let mut idle_options = vec![idle_close_secs, 300, 600, 1800, 3600];
+                idle_options.retain(|secs| *secs <= idle_close_secs);
                 idle_options.sort_unstable();
                 idle_options.dedup();
                 SessionSpec {
@@ -553,6 +608,53 @@ mod tests {
         assert_eq!(metering.dimensions[1].tiers[0].price_usd, 0.90);
     }
 
+    /// The operator fronts each sponsored channel's rent until it closes:
+    /// a seller cannot hold it past an hour, and a channel must lock at
+    /// least the minimum deposit.
+    #[test]
+    fn session_terms_bound_the_rent_the_operator_fronts() {
+        let base = sale(SellPricing::PerRequest { usd: 0.02 });
+        for (idle, cap, needle) in [
+            (2_592_000, 1.0, "session_idle_close_secs"),
+            (
+                MAX_SESSION_IDLE_CLOSE_SECS + 1,
+                1.0,
+                "session_idle_close_secs",
+            ),
+            (0, 1.0, "session_idle_close_secs"),
+            (600, 0.000_001, "session_cap_usd"),
+            (600, f64::NAN, "session_cap_usd"),
+        ] {
+            let mut sale = base.clone();
+            sale.session_idle_close_secs = idle;
+            sale.session_cap_usd = cap;
+            let errs = sale.validate();
+            assert!(
+                errs.iter().any(|e| e.contains(needle)),
+                "{idle} {cap}: {errs:?}"
+            );
+        }
+
+        // Positive control: the bounds themselves are accepted.
+        let mut sale = base.clone();
+        sale.session_idle_close_secs = MAX_SESSION_IDLE_CLOSE_SECS;
+        sale.session_cap_usd = MIN_SESSION_CAP_USD;
+        assert!(sale.validate().is_empty(), "{:?}", sale.validate());
+
+        // Buyers may only shorten the seller's idle close.
+        for (idle, options) in [
+            (600, vec![300, 600]),
+            (120, vec![120]),
+            (3_600, vec![300, 600, 1_800, 3_600]),
+        ] {
+            let mut sale = base.clone();
+            sale.session_idle_close_secs = idle;
+            let session = sale.api_spec().session.unwrap();
+            assert_eq!(session.idle_timeout_options_seconds, Some(options));
+            assert_eq!(session.close_delay_ms, u64::from(idle) * 1_000);
+        }
+    }
+
     #[test]
     fn validation_names_each_problem() {
         let mut sale = sale(SellPricing::PerRequest { usd: 0.0 });
@@ -592,6 +694,29 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("model \"x\" input rate"))
         );
+    }
+
+    #[test]
+    fn currencies_are_distinct_supported_stablecoins() {
+        let mut ok = sale(SellPricing::PerRequest { usd: 0.02 });
+        ok.currencies = vec!["usdc".into(), "USDT".into()];
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+
+        for (currencies, needle) in [
+            (vec!["USDC", "usdc"], "listed more than once"),
+            (vec!["USDC"; 1_000], "listed more than once"),
+            (vec!["USDC", "DOGE"], "unsupported currency `DOGE`"),
+        ] {
+            let mut bad = ok.clone();
+            bad.currencies = currencies.into_iter().map(str::to_string).collect();
+            let errs = bad.validate();
+            assert_eq!(
+                errs.len(),
+                1,
+                "one problem per list, however long: {errs:?}"
+            );
+            assert!(errs[0].contains(needle), "{errs:?}");
+        }
     }
 
     fn sale_with_rates(rates: PricingConfig) -> SellInference {
@@ -807,6 +932,29 @@ mod gate_tests {
             values(header::WWW_AUTHENTICATE.as_str()),
             values(pay_kit::x402::PAYMENT_REQUIRED_HEADER),
         )
+    }
+
+    /// A self-paying seller and buyer move dust through a session; the
+    /// operator settles only once a cent has accrued, so settles stay
+    /// bounded by the earn cap instead of by request count.
+    #[test]
+    fn session_watermarks_settle_only_past_a_cent() {
+        let spec = sale(SellPricing::PerRequest { usd: 0.000_001 })
+            .api_spec()
+            .session
+            .unwrap();
+        let settlement = session_watermark_settlement(&spec);
+        assert_eq!(
+            settlement.interval(),
+            Some(std::time::Duration::from_millis(
+                spec.settlement_interval_ms
+            ))
+        );
+        assert_eq!(
+            settlement.min_delta().map(|min| min.get()),
+            Some(SESSION_MIN_SETTLE_BASE_UNITS)
+        );
+        assert_eq!(SESSION_MIN_SETTLE_BASE_UNITS, 10_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]

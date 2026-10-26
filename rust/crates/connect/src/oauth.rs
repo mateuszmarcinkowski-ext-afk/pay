@@ -4,7 +4,8 @@
 //! from the 401 on `/mcp`, register themselves (RFC 7591), send the user
 //! through `/oauth/authorize` with PKCE, and exchange the code for a bearer
 //! at `/oauth/token`. Tokens are opaque random strings stored hashed: a
-//! one-hour access token and a thirty-day refresh token, rotated on use.
+//! one-hour access token and a thirty-day refresh token (a day for a
+//! guest), rotated on use.
 //!
 //! What "the user" is here is still thin: approving a request mints an
 //! opaque subject. The tenant store binds that subject to a wallet next.
@@ -24,11 +25,21 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::AppState;
+use crate::capacity::{Anonymous, Limits, Row, admit};
 use crate::mcp::Tenant;
 use crate::protocol::{ApiError, is_base64url_alphabet, random_token, sha256_hex};
 
 pub const ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 pub const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Refresh lifetime of a grant no login session stands behind (a guest's):
+/// an idle guest reconnects in one click, and a burst of free guest grants
+/// holds its rows for a day, not a month.
+pub const GUEST_REFRESH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Most guest grant families held at once. Guests cost nothing to mint, so
+/// they share this slice of the token table and never take the rest.
+pub const GUEST_FAMILIES: usize = MAX_ROWS / 8;
+/// Most grant families one subject holds; its oldest makes way for a new one.
+pub const FAMILIES_PER_SUBJECT: usize = 32;
 /// A code must be exchanged within this window after approval.
 pub const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// A pending authorization waits this long for the user to decide. Long
@@ -36,6 +47,16 @@ pub const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const REQUEST_TTL: Duration = Duration::from_secs(30 * 60);
 /// Most rows of any one kind held at once; expired rows are swept when full.
 pub const MAX_ROWS: usize = 16_384;
+/// Sign-ins in flight: anonymous until a sign-in parks one for funding, so
+/// a burst of them displaces itself instead of locking out every host.
+const PENDING_LIMITS: Limits = Limits {
+    rows: MAX_ROWS,
+    per_owner: 8,
+    anonymous: Anonymous::EvictOldest,
+};
+/// Codes waiting for exchange: a guest's are anonymous, others are held by
+/// the login session that approved them.
+const CODE_LIMITS: Limits = PENDING_LIMITS;
 /// The one scope this server knows: use the pay tools.
 pub const SCOPE: &str = "mcp";
 
@@ -47,7 +68,7 @@ pub struct Client {
     pub client_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
-    pub redirect_uris: Vec<String>,
+    pub redirect_uris: RedirectUris,
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
@@ -63,6 +84,57 @@ pub struct Client {
     secret_hash: Option<String>,
     #[serde(skip)]
     created_at: Instant,
+}
+
+/// Most redirect URIs one client registers; real hosts send one or two.
+pub const MAX_REDIRECT_URIS: usize = 8;
+/// Longest redirect URI a client registers.
+pub const MAX_REDIRECT_URI_LEN: usize = 2048;
+/// Largest `POST /oauth/register` body; real registrations are under 1 KiB.
+pub const MAX_REGISTRATION_BYTES: usize = 16 * 1024;
+/// Longest OAuth `state` a pending authorization keeps.
+pub const MAX_STATE_LEN: usize = 1024;
+
+/// A client's redirect URIs: at least one, at most [`MAX_REDIRECT_URIS`]
+/// distinct allowed URIs of at most [`MAX_REDIRECT_URI_LEN`] bytes each, so a
+/// registration holds a bounded amount of memory for as long as it lives.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct RedirectUris(Vec<String>);
+
+impl RedirectUris {
+    pub fn parse(uris: Vec<String>) -> Result<Self, String> {
+        if uris.is_empty() {
+            return Err("redirect_uris must list at least one URI.".to_string());
+        }
+        let mut distinct: Vec<String> = Vec::new();
+        for uri in uris {
+            if distinct.contains(&uri) {
+                continue;
+            }
+            if distinct.len() == MAX_REDIRECT_URIS {
+                return Err(format!(
+                    "redirect_uris may list at most {MAX_REDIRECT_URIS} URIs."
+                ));
+            }
+            if uri.len() > MAX_REDIRECT_URI_LEN {
+                return Err(format!(
+                    "a redirect_uri may be at most {MAX_REDIRECT_URI_LEN} bytes."
+                ));
+            }
+            crate::hosts::redirect_allowed(&uri)
+                .map_err(|why| format!("redirect_uri `{uri}`: {why}"))?;
+            distinct.push(uri);
+        }
+        Ok(Self(distinct))
+    }
+}
+
+impl std::ops::Deref for RedirectUris {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        &self.0
+    }
 }
 
 /// Authentication methods a client may register with. Secrets are issued
@@ -97,6 +169,24 @@ struct CodeGrant {
     /// The upstream login session the approval came from, if any.
     session: Option<String>,
     created_at: Instant,
+}
+
+impl Row for PendingAuthorization {
+    fn owner(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
+}
+
+impl Row for CodeGrant {
+    fn owner(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,23 +279,6 @@ fn family_of(refresh_token: &str) -> Option<&str> {
     (!family.is_empty() && !secret.is_empty()).then_some(family)
 }
 
-/// Insert into a bounded map, sweeping expired rows when it is full.
-fn insert_bounded<V>(
-    map: &mut HashMap<String, V>,
-    key: String,
-    value: V,
-    expired: impl Fn(&V) -> bool,
-) -> bool {
-    if map.len() >= MAX_ROWS {
-        map.retain(|_, v| !expired(v));
-        if map.len() >= MAX_ROWS {
-            return false;
-        }
-    }
-    map.insert(key, value);
-    true
-}
-
 impl Store {
     pub fn new(public_url: &str) -> Self {
         Self::with_clock(public_url, std::sync::Arc::new(Instant::now))
@@ -241,14 +314,8 @@ impl Store {
     /// returned once beside the stored record.
     pub fn register(&self, req: RegistrationRequest) -> Result<(Client, Option<String>), ApiError> {
         let invalid = |msg: &str| ApiError::bad_request("invalid_client_metadata", msg);
-        if req.redirect_uris.is_empty() {
-            return Err(invalid("redirect_uris must list at least one URI."));
-        }
-        for uri in &req.redirect_uris {
-            crate::hosts::redirect_allowed(uri)
-                .map_err(|why| invalid(&format!("redirect_uri `{uri}`: {why}")))?;
-        }
-        let host = crate::hosts::identify(req.client_name.as_deref(), &req.redirect_uris);
+        let redirect_uris = RedirectUris::parse(req.redirect_uris).map_err(|why| invalid(&why))?;
+        let host = crate::hosts::identify(req.client_name.as_deref(), &redirect_uris);
         let auth_method = req
             .token_endpoint_auth_method
             .clone()
@@ -260,50 +327,73 @@ impl Store {
             )));
         }
         let secret = (auth_method != "none").then(random_token);
-        let grant_types = req
+        let mut grant_types = req
             .grant_types
-            .clone()
             .unwrap_or_else(|| vec!["authorization_code".to_string()]);
         for grant in &grant_types {
             if grant != "authorization_code" && grant != "refresh_token" {
                 return Err(invalid(&format!("grant_type `{grant}` is not supported.")));
             }
         }
-        let response_types = req
+        grant_types.sort_unstable();
+        grant_types.dedup();
+        let mut response_types = req
             .response_types
-            .clone()
             .unwrap_or_else(|| vec!["code".to_string()]);
         if response_types.iter().any(|r| r != "code") {
             return Err(invalid("only the `code` response type is supported."));
         }
+        response_types.dedup();
         let client = Client {
             client_id: format!("cli_{}", random_token()),
             client_name: req
                 .client_name
                 .map(|n| n.trim().chars().take(120).collect::<String>())
                 .filter(|n| !n.is_empty()),
-            redirect_uris: req.redirect_uris,
+            redirect_uris,
             grant_types,
             response_types,
             token_endpoint_auth_method: auth_method,
             client_id_issued_at: unix_now(),
             scope: req
                 .scope
-                .map(|s| s.split_whitespace().take(8).collect::<Vec<_>>().join(" "))
+                .map(|s| {
+                    s.split_whitespace()
+                        .filter(|scope| scope.len() <= 64)
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .filter(|s| !s.is_empty()),
             host: host.id,
             secret_hash: secret.as_deref().map(sha256_hex),
             created_at: self.now(),
         };
+        // Lock order: tokens, then clients.
+        let tokens = self.tokens.lock().unwrap();
         let mut clients = self.clients.lock().unwrap();
-        // Clients never expire on their own; when the table is full the
-        // oldest unused registration goes. A live client re-registers.
-        if clients.len() >= MAX_ROWS
-            && let Some(oldest) = clients
+        // Clients never expire on their own. When the table is full the
+        // oldest registration nobody holds a live token for goes; one that
+        // users are signed in through never does.
+        if clients.len() >= MAX_ROWS {
+            let now = self.now();
+            let held: std::collections::HashSet<&str> = tokens
                 .values()
+                .filter(|token| now <= token.expires_at)
+                .map(|token| token.client_id.as_str())
+                .collect();
+            let oldest = clients
+                .values()
+                .filter(|c| !held.contains(c.client_id.as_str()))
                 .min_by_key(|c| c.created_at)
                 .map(|c| c.client_id.clone())
-        {
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "temporarily_unavailable",
+                        "Too many clients are registered. Try again later.",
+                    )
+                })?;
             clients.remove(&oldest);
         }
         clients.insert(client.client_id.clone(), client.clone());
@@ -341,18 +431,20 @@ impl Store {
     /// Park a validated authorization request for the consent page.
     pub fn create_pending(&self, request: PendingAuthorization) -> Result<(), ApiError> {
         let now = self.now();
-        let mut pending = self.pending.lock().unwrap();
-        if insert_bounded(&mut pending, request.id.clone(), request, |p| {
-            now.saturating_duration_since(p.created_at) > REQUEST_TTL
-        }) {
-            Ok(())
-        } else {
-            Err(ApiError::new(
+        admit(
+            &mut self.pending.lock().unwrap(),
+            request.id.clone(),
+            request,
+            PENDING_LIMITS,
+            |p| now.saturating_duration_since(p.created_at) > REQUEST_TTL,
+        )
+        .map_err(|_| {
+            ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "busy",
                 "Too many sign-ins are in progress. Try again in a few minutes.",
-            ))
-        }
+            )
+        })
     }
 
     pub fn pending(&self, id: &str) -> Option<PendingAuthorization> {
@@ -379,13 +471,19 @@ impl Store {
         session: Option<&str>,
         live: impl FnOnce() -> bool,
     ) -> Option<(PendingAuthorization, String)> {
-        let request = self.pending.lock().unwrap().remove(id)?;
-        if self.now().saturating_duration_since(request.created_at) > REQUEST_TTL {
+        let mut pending = self.pending.lock().unwrap();
+        let request = pending.get(id)?;
+        let now = self.now();
+        if now.saturating_duration_since(request.created_at) > REQUEST_TTL {
+            pending.remove(id);
             return None;
         }
         let session = session.or(request.session.as_deref());
-        let client = self.client(&request.client_id)?;
-        if !host_bound(&client, &request.redirect_uri) {
+        if !self
+            .client(&request.client_id)
+            .is_some_and(|client| host_bound(&client, &request.redirect_uri))
+        {
+            pending.remove(id);
             return None;
         }
         let code = random_token();
@@ -396,28 +494,35 @@ impl Store {
             subject: subject.to_string(),
             scope: request.scope.clone(),
             session: session.map(str::to_string),
-            created_at: self.now(),
+            created_at: now,
         };
-        let now = self.now();
         let mut codes = self.codes.lock().unwrap();
-        if session.is_some() && !live() {
+        if grant.session.is_some() && !live() {
             return None;
         }
-        insert_bounded(&mut codes, sha256_hex(&code), grant, |g| {
+        // The request is consumed only once its code is stored.
+        admit(&mut codes, sha256_hex(&code), grant, CODE_LIMITS, |g| {
             now.saturating_duration_since(g.created_at) > CODE_TTL
         })
-        .then_some((request, code))
+        .ok()?;
+        Some((pending.remove(id)?, code))
     }
 
     /// Remember the login session of an approval that continues later (after
-    /// funding), so the code it ends with is still bound to it.
+    /// funding), so the code it ends with is still bound to it and the
+    /// request is held by that session.
     pub fn attach_session(&self, id: &str, session: Option<&str>) -> Option<()> {
         let mut pending = self.pending.lock().unwrap();
-        let request = pending.get_mut(id)?;
-        if let Some(session) = session {
-            request.session = Some(session.to_string());
-        }
-        Some(())
+        let Some(session) = session else {
+            return pending.contains_key(id).then_some(());
+        };
+        let mut request = pending.remove(id)?;
+        request.session = Some(session.to_string());
+        let now = self.now();
+        admit(&mut pending, id.to_string(), request, PENDING_LIMITS, |p| {
+            now.saturating_duration_since(p.created_at) > REQUEST_TTL
+        })
+        .ok()
     }
 
     /// Consume the pending request without issuing anything.
@@ -577,6 +682,30 @@ impl Store {
         family: &str,
     ) -> Result<TokenResponse, TokenError> {
         tokens.retain(|_, token| now <= token.expires_at);
+        let guest = session.is_none();
+        if guest
+            && tokens
+                .values()
+                .filter(|token| token.kind == TokenKind::Refresh && token.session.is_none())
+                .count()
+                >= GUEST_FAMILIES
+        {
+            return Err(TokenError::temporarily_unavailable(
+                "Too many guest connections right now. Sign in to connect, or try again later.",
+            ));
+        }
+        // A subject at its quota gives up its own oldest grant, never
+        // anyone else's.
+        let own = tokens
+            .values()
+            .filter(|token| token.kind == TokenKind::Refresh && token.subject == subject);
+        if own.clone().count() >= FAMILIES_PER_SUBJECT
+            && let Some(oldest) = own
+                .min_by_key(|token| token.expires_at)
+                .map(|token| token.family.clone())
+        {
+            tokens.retain(|_, token| token.family != oldest);
+        }
         if tokens.len() > MAX_ROWS.saturating_sub(2) {
             return Err(TokenError::temporarily_unavailable(
                 "The token store is full. Try again later.",
@@ -584,9 +713,14 @@ impl Store {
         }
         let access_token = random_token();
         let refresh_token = format!("{family}.{}", random_token());
+        let refresh_ttl = if guest {
+            GUEST_REFRESH_TTL
+        } else {
+            REFRESH_TTL
+        };
         for (token, kind, ttl) in [
             (&access_token, TokenKind::Access, ACCESS_TTL),
-            (&refresh_token, TokenKind::Refresh, REFRESH_TTL),
+            (&refresh_token, TokenKind::Refresh, refresh_ttl),
         ] {
             tokens.insert(
                 sha256_hex(token),
@@ -865,6 +999,12 @@ pub async fn authorize(
             "redirect_uri does not belong to this client's host.",
         ));
     }
+    if q.state.as_ref().is_some_and(|s| s.len() > MAX_STATE_LEN) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            format!("state may be at most {MAX_STATE_LEN} bytes."),
+        ));
+    }
     let state_param = q.state.as_deref().filter(|s| !s.is_empty());
     let fail = |error: &str, description: &str| {
         Ok(error_redirect(
@@ -1092,11 +1232,20 @@ pub async fn approve(
         let subject = format!("{}{}", crate::tenants::GUEST_PREFIX, &random_token()[..24]);
         let (request, code) = store.approve(&id, &subject).ok_or_else(unknown_request)?;
         tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved for a guest");
-        return Ok(Json(DecisionResponse {
+        let mut response = Json(DecisionResponse {
             redirect: Some(code_redirect(&request, &code)),
             fund: None,
         })
-        .into_response());
+        .into_response();
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            state.tenants().guest_cookie(
+                &headers,
+                &subject,
+                state.public_url().starts_with("https://"),
+            ),
+        );
+        return Ok(response);
     }
     let (subject, fresh_login, bound, session) = match bearer {
         Some(token) => {
@@ -1264,7 +1413,7 @@ pub(crate) async fn approve_with_privy(
                 && wallet.pay_can_sign
         });
         if unchanged {
-            seed_spend(state, &existing).await?;
+            seed_spend(state, &existing).await;
             return Ok(PrivyApproval {
                 subject,
                 bound: None,
@@ -1316,7 +1465,7 @@ pub(crate) async fn approve_with_privy(
             })));
         }
         let record = privy.tenant_record(&subject, &wallet);
-        seed_spend(state, &record).await?;
+        seed_spend(state, &record).await;
         // The provider may have moved the wallet while we waited on it and
         // on its history: bind only what it still confirms is this user's.
         let confirmed = privy
@@ -1350,23 +1499,16 @@ pub(crate) async fn approve_with_privy(
 }
 
 /// Count what the wallet already spent today before it can sign here.
+/// Unreadable history never refuses the sign-in; it withholds spend.
 #[cfg(feature = "privy")]
-async fn seed_spend(
-    state: &AppState,
-    record: &crate::tenants::TenantRecord,
-) -> Result<(), ApiError> {
-    state
+async fn seed_spend(state: &AppState, record: &crate::tenants::TenantRecord) {
+    if let crate::tenants::Seeded::Held { why } = state
         .tenants()
         .seed_spend(record, state.spend_history())
         .await
-        .map_err(|error| {
-            tracing::warn!(%error, wallet = %record.pubkey, "wallet spend history unavailable");
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "spend_history_unavailable",
-                "Your wallet's spending today could not be checked. Try again shortly.",
-            )
-        })
+    {
+        tracing::warn!(error = %why, wallet = %record.pubkey, "wallet spend history unavailable; no spend until it is read");
+    }
 }
 
 /// A wallet binding the provider no longer confirms: unbind every subject
@@ -1604,23 +1746,34 @@ pub struct LinkView {
     pub privy: Option<PrivyLogin>,
 }
 
-fn unknown_link() -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        "unknown_link",
-        "This link is unknown, used, or expired. Ask your MCP client to pay again to get a fresh one.",
-    )
+fn link_refused(why: crate::tenants::LinkRefused) -> ApiError {
+    match why {
+        crate::tenants::LinkRefused::Unknown => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_link",
+            "This link is unknown, used, or expired. Ask your MCP client to pay again to get a fresh one.",
+        ),
+        crate::tenants::LinkRefused::OtherBrowser => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "other_browser",
+            "This link belongs to a connection made in another browser. Open it in the browser \
+             where you connected your MCP client, or reconnect there and sign in. If someone sent \
+             you this link, do not use it: it would let them spend from your wallet.",
+        ),
+    }
 }
 
-/// `GET /api/oauth/link/{ticket}`: is this ticket live, and how to sign in.
+/// `GET /api/oauth/link/{ticket}`: is this ticket live for this browser (the
+/// one that approved its guest), and how to sign in.
 pub async fn link_view(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let subject = state
         .tenants()
-        .peek_link(&ticket)
-        .ok_or_else(unknown_link)?;
+        .peek_link(&ticket, &headers)
+        .map_err(link_refused)?;
     let mut response = Json(LinkView {
         guest: state.tenants().get(&subject).is_none(),
         privy: privy_login(&state),
@@ -1653,9 +1806,10 @@ pub struct LinkCompleteBody {
 }
 
 /// `POST /api/oauth/link/{ticket}` with `Authorization: Bearer <privy
-/// access token>`: attach the signed-in user's wallet to the guest
-/// connection the ticket names. The guest's existing tokens now pay from
-/// that wallet; the browser is remembered as that user.
+/// access token>`, from the browser that approved the guest: attach the
+/// signed-in user's wallet to the guest connection the ticket names. The
+/// guest's existing tokens now pay from that wallet; the browser is
+/// remembered as that user.
 pub async fn link_complete(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
@@ -1687,8 +1841,8 @@ pub async fn link_complete(
     // every error, so a provider failure can be retried safely.
     let claim = state
         .tenants()
-        .claim_link(&ticket)
-        .ok_or_else(unknown_link)?;
+        .claim_link(&ticket, &headers)
+        .map_err(link_refused)?;
     let guest = claim.subject().to_string();
     let PrivyApproval {
         subject,
@@ -2021,6 +2175,98 @@ mod tests {
         );
     }
 
+    /// A grant for `subject`, approved in `session` (none for a guest).
+    fn grant(
+        store: &Store,
+        client: &Client,
+        subject: &str,
+        session: Option<&str>,
+    ) -> Result<TokenResponse, TokenError> {
+        let mut request = pending_for(client);
+        request.created_at = store.now();
+        let id = request.id.clone();
+        store.create_pending(request).unwrap();
+        let (_, code) = store
+            .approve_in_session(&id, subject, session, || true)
+            .unwrap();
+        store.exchange_code(&client.client_id, &code, VERIFIER, None)
+    }
+
+    /// Mint guest grants until the store refuses one; how many it took.
+    fn fill_with_guests(store: &Store, client: &Client) -> usize {
+        (0..MAX_ROWS)
+            .take_while(|i| grant(store, client, &format!("guest_{i}"), None).is_ok())
+            .count()
+    }
+
+    /// Free guest grants fill only their own slice of the token table: a
+    /// signed-in user still connects, and live guests still refresh.
+    #[test]
+    fn guest_grants_cannot_crowd_out_signed_in_users() {
+        let now = std::sync::Arc::new(Mutex::new(Instant::now()));
+        let clock_now = now.clone();
+        let store = Store::with_clock(
+            "https://cloud.test",
+            std::sync::Arc::new(move || *clock_now.lock().unwrap()),
+        );
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let first_guest = grant(&store, &client, "guest_first", None).unwrap();
+
+        assert_eq!(fill_with_guests(&store, &client), GUEST_FAMILIES - 1);
+        assert_eq!(
+            grant(&store, &client, "guest_late", None)
+                .unwrap_err()
+                .error,
+            "temporarily_unavailable"
+        );
+        let user = grant(&store, &client, "sub_user", Some("sess_user")).unwrap();
+        assert!(store.authenticate(&user.access_token).is_some());
+        let rotated = store
+            .refresh(&client.client_id, &first_guest.refresh_token)
+            .unwrap();
+        assert!(store.authenticate(&rotated.access_token).is_some());
+
+        // Guest rows lapse after a day; a signed-in user's last a month.
+        *now.lock().unwrap() += GUEST_REFRESH_TTL + Duration::from_secs(1);
+        assert!(
+            store
+                .refresh(&client.client_id, &rotated.refresh_token)
+                .is_err()
+        );
+        let user = store
+            .refresh(&client.client_id, &user.refresh_token)
+            .unwrap();
+        assert!(store.authenticate(&user.access_token).is_some());
+        assert!(grant(&store, &client, "guest_late", None).is_ok());
+    }
+
+    /// One account looping approvals recycles its own grants only.
+    #[test]
+    fn a_subject_at_its_quota_gives_up_only_its_own_oldest_grant() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let bystander = grant(&store, &client, "sub_b", Some("sess_b")).unwrap();
+        let mut own: Vec<TokenResponse> = (0..=FAMILIES_PER_SUBJECT)
+            .map(|_| grant(&store, &client, "sub_a", Some("sess_a")).unwrap())
+            .collect();
+        assert!(
+            store
+                .refresh(&client.client_id, &own[0].refresh_token)
+                .is_err()
+        );
+        assert!(store.authenticate(&own[0].access_token).is_none());
+        own.remove(0);
+        for pair in &own {
+            assert!(store.authenticate(&pair.access_token).is_some());
+        }
+        assert!(store.authenticate(&bystander.access_token).is_some());
+        assert!(
+            store
+                .refresh(&client.client_id, &bystander.refresh_token)
+                .is_ok()
+        );
+    }
+
     /// A session signed out while its approval was still in flight gets no
     /// code: liveness is checked as the code is stored.
     #[test]
@@ -2160,8 +2406,8 @@ mod tests {
         assert_eq!(client.token_endpoint_auth_method, "none");
         assert!(secret.is_none(), "public clients get no secret");
         assert_eq!(
-            store.client(&client.client_id).unwrap().redirect_uris,
-            vec![GROK_REDIRECT]
+            store.client(&client.client_id).unwrap().redirect_uris[..],
+            [GROK_REDIRECT]
         );
         assert!(store.authenticate_client(&client.client_id, None).is_ok());
 
@@ -2208,6 +2454,169 @@ mod tests {
         let mut implicit = grok_registration();
         implicit.response_types = Some(vec!["token".to_string()]);
         assert!(store.register(implicit).is_err());
+    }
+
+    /// connect/03: what a registration stores is bounded however large the
+    /// request, so open registration cannot grow the heap without limit.
+    #[test]
+    fn registration_stores_a_bounded_client() {
+        let store = Store::new("https://cloud.test/");
+        let invalid = |req: RegistrationRequest| store.register(req).unwrap_err().error;
+
+        let mut repeated = grok_registration();
+        repeated.redirect_uris = vec![GROK_REDIRECT.to_string(); 10_000];
+        repeated.grant_types = Some(vec!["refresh_token".to_string(); 10_000]);
+        repeated.response_types = Some(vec!["code".to_string(); 10_000]);
+        repeated.scope = Some(format!("{} mcp", "s".repeat(100_000)));
+        let (client, _) = store.register(repeated).unwrap();
+        let stored = store.client(&client.client_id).unwrap();
+        assert_eq!(stored.redirect_uris[..], [GROK_REDIRECT]);
+        assert_eq!(stored.grant_types, ["refresh_token"]);
+        assert_eq!(stored.response_types, ["code"]);
+        assert_eq!(stored.scope.as_deref(), Some("mcp"));
+
+        let distinct = |n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| format!("https://host.example/cb/{i}"))
+                .collect()
+        };
+        let mut many = grok_registration();
+        many.redirect_uris = distinct(MAX_REDIRECT_URIS + 1);
+        assert_eq!(invalid(many), "invalid_client_metadata");
+        let mut long = grok_registration();
+        long.redirect_uris = vec![format!(
+            "https://host.example/{}",
+            "a".repeat(MAX_REDIRECT_URI_LEN)
+        )];
+        assert_eq!(invalid(long), "invalid_client_metadata");
+
+        // Control: the most a client may register is accepted as sent.
+        let mut most = grok_registration();
+        most.redirect_uris = distinct(MAX_REDIRECT_URIS);
+        let (client, _) = store.register(most).unwrap();
+        assert_eq!(client.redirect_uris.len(), MAX_REDIRECT_URIS);
+    }
+
+    /// connect/05: open registration cannot push out a client that users
+    /// are signed in through; only registrations nobody uses make way.
+    #[test]
+    fn a_full_client_table_never_evicts_a_client_in_use() {
+        let store = Store::new("https://cloud.test/");
+        let (used, _) = store.register(grok_registration()).unwrap();
+        let pair = grant(&store, &used, "sub_1", Some("sess_1")).unwrap();
+        let (idle, _) = store.register(grok_registration()).unwrap();
+        for _ in 0..MAX_ROWS {
+            store.register(grok_registration()).unwrap();
+        }
+        assert!(store.client(&used.client_id).is_some());
+        assert!(store.refresh(&used.client_id, &pair.refresh_token).is_ok());
+        assert!(
+            store.client(&idle.client_id).is_none(),
+            "unused, so it went"
+        );
+        assert_eq!(store.clients.lock().unwrap().len(), MAX_ROWS);
+
+        // Every client in use: registration waits rather than evict one.
+        {
+            let ids: Vec<String> = store.clients.lock().unwrap().keys().cloned().collect();
+            let far = store.now() + ACCESS_TTL;
+            let mut tokens = store.tokens.lock().unwrap();
+            for id in ids {
+                tokens.insert(
+                    format!("held-{id}"),
+                    TokenRecord {
+                        kind: TokenKind::Access,
+                        client_id: id.clone(),
+                        subject: "sub_x".to_string(),
+                        scope: SCOPE.to_string(),
+                        session: None,
+                        family: id,
+                        expires_at: far,
+                    },
+                );
+            }
+        }
+        assert_eq!(
+            store.register(grok_registration()).unwrap_err().error,
+            "temporarily_unavailable"
+        );
+        assert!(store.client(&used.client_id).is_some());
+    }
+
+    /// connect/06: a burst of anonymous authorization requests displaces
+    /// itself, oldest first, instead of refusing every sign-in; a request a
+    /// signed-in user parked for funding is never displaced.
+    #[test]
+    fn a_burst_of_authorization_requests_cannot_lock_out_sign_ins() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let parked = pending_for(&client);
+        store.create_pending(parked.clone()).unwrap();
+        store.attach_session(&parked.id, Some("sess_1")).unwrap();
+        let oldest = pending_for(&client);
+        store.create_pending(oldest.clone()).unwrap();
+        for _ in 0..MAX_ROWS {
+            store.create_pending(pending_for(&client)).unwrap();
+        }
+        let late = pending_for(&client);
+        store.create_pending(late.clone()).unwrap();
+        assert!(store.pending(&late.id).is_some());
+        assert!(store.pending(&oldest.id).is_none(), "the oldest went");
+        assert!(store.pending(&parked.id).is_some(), "parked stays");
+        assert!(
+            store
+                .approve_in_session(&parked.id, "sub_1", None, || true)
+                .is_some()
+        );
+    }
+
+    /// connect/06: guest codes cannot crowd out an approval, and an approval
+    /// refused for want of room leaves its request to approve again.
+    #[test]
+    fn a_full_code_table_neither_refuses_users_nor_consumes_their_request() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        for i in 0..MAX_ROWS {
+            let request = pending_for(&client);
+            store.create_pending(request.clone()).unwrap();
+            store.approve(&request.id, &format!("guest_{i}")).unwrap();
+        }
+        let request = pending_for(&client);
+        store.create_pending(request.clone()).unwrap();
+        let (_, code) = store
+            .approve_in_session(&request.id, "sub_1", Some("sess_1"), || true)
+            .unwrap();
+        assert!(
+            store
+                .exchange_code(&client.client_id, &code, VERIFIER, None)
+                .is_ok()
+        );
+
+        // Every slot held by some session's code: refused, not consumed.
+        {
+            let mut codes = store.codes.lock().unwrap();
+            codes.clear();
+            for i in 0..MAX_ROWS {
+                codes.insert(
+                    format!("held-{i}"),
+                    CodeGrant {
+                        client_id: client.client_id.clone(),
+                        redirect_uri: GROK_REDIRECT.to_string(),
+                        code_challenge: pkce_challenge(VERIFIER),
+                        subject: format!("sub_{i}"),
+                        scope: SCOPE.to_string(),
+                        session: Some(format!("sess_{i}")),
+                        created_at: store.now(),
+                    },
+                );
+            }
+        }
+        let request = pending_for(&client);
+        store.create_pending(request.clone()).unwrap();
+        assert!(store.approve(&request.id, "guest_x").is_none());
+        assert!(store.pending(&request.id).is_some(), "still pending");
+        store.codes.lock().unwrap().remove("held-0");
+        assert!(store.approve(&request.id, "guest_x").is_some());
     }
 
     #[test]
@@ -3182,6 +3591,167 @@ mod tests {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     }
 
+    /// Guest grants are free to mint, so they must not hold the sell
+    /// registry's shared endpoint slots.
+    #[cfg(feature = "sell")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_token_cannot_create_a_sell_endpoint() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(sk.as_bytes());
+        keypair[32..].copy_from_slice(sk.verifying_key().as_bytes());
+        let signer = pay_kit::solana_keychain::MemorySigner::from_bytes(&keypair).unwrap();
+        let operator = crate::sell::Operator::new(
+            std::sync::Arc::new(signer),
+            "http://127.0.0.1:1",
+            "0123456789abcdef0123456789abcdef",
+        );
+        operator
+            .blockhashes
+            .set("11111111111111111111111111111111".into(), 1_000, 1);
+        let app = crate::router(
+            AppState::new("https://cloud.test")
+                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                .with_sell(operator),
+        );
+        let client_id = register_grok(&app).await;
+        let id = start_authorization(&app, &client_id, None).await;
+        let approved = post_json(
+            &app,
+            &format!("/api/oauth/authorize/{id}/approve"),
+            json!({"guest": true}),
+        )
+        .await;
+        let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+        let code = redirect
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let tokens = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
+                ("code", &code),
+                ("code_verifier", VERIFIER),
+                ("redirect_uri", GROK_REDIRECT),
+            ],
+        )
+        .await;
+        let access = tokens.json()["access_token"].as_str().unwrap().to_string();
+
+        let create = json!({
+            "pricing": { "per_request_usd": 0.02 }, "model": "agent", "network": "devnet",
+            "earn_cap_usd": 0.01, "recipient": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+        });
+        let created =
+            post_json_with(&app, "/v1/endpoints", create.clone(), None, Some(&access)).await;
+        assert_eq!(created.status, StatusCode::FORBIDDEN, "{}", created.body);
+        assert_eq!(created.json()["error"], "wallet_required");
+        let unknown = post_json_with(&app, "/v1/endpoints", create, None, Some("nope")).await;
+        assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "{}", unknown.body);
+    }
+
+    /// connect/03: an oversized registration body is refused before it is
+    /// parsed, and an oversized `state` is never parked.
+    #[tokio::test]
+    async fn oversized_registrations_and_states_are_refused() {
+        let app = app();
+        let mut body = grok_dcr_body();
+        body["redirect_uris"] = json!(vec![GROK_REDIRECT; 2_000]);
+        let reply = post_json(&app, "/oauth/register", body).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            reply.body
+        );
+
+        let client_id = register_grok(&app).await;
+        let long = "s".repeat(MAX_STATE_LEN + 1);
+        let with_state = |state: &str| {
+            authorize_path(&client_id, &[]).replace("state=st4te", &format!("state={state}"))
+        };
+        let reply = get(&app, &with_state(&long)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+        assert_eq!(reply.json()["error"], "invalid_request");
+        let most = "s".repeat(MAX_STATE_LEN);
+        let reply = get(&app, &with_state(&most)).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    }
+
+    /// connect/05, over HTTP: a registration burst leaves a connected
+    /// host's client in place, so its refresh still succeeds.
+    #[tokio::test]
+    async fn a_registration_burst_does_not_disconnect_a_host() {
+        let state = AppState::new("https://cloud.test")
+            .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]));
+        let app = crate::router(state.clone());
+        let client_id = register_grok(&app).await;
+        let request_id = start_authorization(&app, &client_id, None).await;
+        let approved = post_json(
+            &app,
+            &format!("/api/oauth/authorize/{request_id}/approve"),
+            json!({ "guest": true }),
+        )
+        .await;
+        let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+        let code = redirect
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let tokens = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
+                ("code", &code),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(tokens.status, StatusCode::OK, "{}", tokens.body);
+        let refresh = tokens.json()["refresh_token"].as_str().unwrap().to_string();
+
+        let store = state.oauth().unwrap();
+        for _ in 0..MAX_ROWS {
+            store.register(grok_registration()).unwrap();
+        }
+        let rotated = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("refresh_token", &refresh),
+            ],
+        )
+        .await;
+        assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    }
+
+    /// connect/06, over HTTP: a host's authorization goes through after a
+    /// burst of parked requests filled the table.
+    #[tokio::test]
+    async fn authorize_still_parks_a_request_after_a_burst() {
+        let state = AppState::new("https://cloud.test")
+            .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]));
+        let app = crate::router(state.clone());
+        let client_id = register_grok(&app).await;
+        let store = state.oauth().unwrap();
+        let client = store.client(&client_id).unwrap();
+        for _ in 0..MAX_ROWS {
+            store.create_pending(pending_for(&client)).unwrap();
+        }
+        let request_id = start_authorization(&app, &client_id, None).await;
+        let view = get(&app, &format!("/api/oauth/authorize/{request_id}")).await;
+        assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+    }
+
     // ── Privy login on the consent page ────────────────────────────────
 
     #[cfg(feature = "privy")]
@@ -3340,15 +3910,50 @@ mod tests {
             )
         }
 
+        /// connect/02: a burst of free guest grants cannot lock signed-in
+        /// users out of the token endpoint, and the guest path says why.
+        #[tokio::test]
+        async fn a_guest_burst_leaves_room_for_privy_sign_ins() {
+            let (app, state, fake, _) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let store = state.oauth().unwrap();
+            let client = store.client(&client_id).unwrap();
+            assert_eq!(fill_with_guests(store, &client), GUEST_FAMILIES);
+
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let approved = post_json_as(
+                &app,
+                &approve_path(&request_id),
+                json!({ "guest": true }),
+                None,
+            )
+            .await;
+            let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+            let code = redirect
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            let refused = post_form(
+                &app,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &client_id),
+                    ("code", &code),
+                    ("code_verifier", VERIFIER),
+                ],
+            )
+            .await;
+            assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(refused.json()["error"], "temporarily_unavailable");
+
+            let (access, _) = privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+            assert!(topup_text(&app, &access).await.contains(ADDRESS));
+        }
+
         #[tokio::test]
         async fn a_wallet_bound_after_a_restart_keeps_todays_spend() {
-            struct Down;
-            #[async_trait::async_trait]
-            impl crate::tenants::SpendHistory for Down {
-                async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
-                    Err("rpc down".into())
-                }
-            }
             for (history, cap_left) in [
                 (
                     Arc::new(crate::tenants::FixedHistory(100_000))
@@ -3379,31 +3984,69 @@ mod tests {
                 );
             }
 
-            // Unknown history: the sign-in fails closed.
+            // A rate-limited history read (anyone can push a wallet's
+            // history past the public RPC's limit) still signs in, with
+            // nothing to spend until a later sign-in reads it.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let limited = Arc::new(AtomicBool::new(true));
+            let rpc = {
+                let limited = limited.clone();
+                move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let limited = limited.load(Ordering::SeqCst);
+                    async move {
+                        use axum::response::IntoResponse;
+                        if limited {
+                            return StatusCode::TOO_MANY_REQUESTS.into_response();
+                        }
+                        let result = match request["method"].as_str().unwrap() {
+                            "getTokenAccountsByOwner" => json!({ "value": [] }),
+                            "getSignaturesForAddress" => json!([]),
+                            other => panic!("{other}"),
+                        };
+                        axum::Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+                            .into_response()
+                    }
+                }
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().route("/", axum::routing::post(rpc)),
+                )
+                .await
+                .unwrap();
+            });
             let mock = Arc::new(MockPrivy::default());
             let fake = FakeApp::new(&mock_privy(mock.clone()).await);
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
-                .with_spend_history(Arc::new(Down));
+                .with_spend_history(Arc::new(crate::privy::OnChainSpendHistory::new(format!(
+                    "http://{addr}/"
+                ))));
             let app = crate::router(state.clone());
             let client_id = register_grok(&app).await;
-            let request_id = start_authorization(&app, &client_id, None).await;
-            let refused = post_json_with(
-                &app,
-                &approve_path(&request_id),
-                json!({}),
-                None,
-                Some(&fake.token_for(USER)),
-            )
-            .await;
-            assert_eq!(
-                refused.status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{}",
-                refused.body
+            privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+            let tenant = state
+                .tenants()
+                .get(&crate::privy::subject_for_user(USER))
+                .unwrap();
+            assert!(
+                state
+                    .tenants()
+                    .reserve_cli_transaction(&tenant, 100)
+                    .is_err()
             );
-            assert!(state.tenants().is_empty());
+            limited.store(false, Ordering::SeqCst);
+            privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+            assert!(
+                state
+                    .tenants()
+                    .reserve_cli_transaction(&tenant, 100)
+                    .is_ok()
+            );
         }
 
         #[tokio::test]
@@ -3782,10 +4425,8 @@ mod tests {
             )
             .await;
             assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
-            assert!(
-                approved.headers.get(header::SET_COOKIE).is_none(),
-                "guests get no cookie"
-            );
+            let guest_cookie = cookie_of(&approved);
+            assert!(guest_cookie.starts_with("pay_guest="), "{guest_cookie}");
             assert!(state.tenants().is_empty(), "no wallet bound");
             let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
             let code = redirect
@@ -3823,11 +4464,16 @@ mod tests {
                 .next()
                 .unwrap()
                 .to_string();
-            let view = get(&app, &format!("/api/oauth/link/{ticket}")).await;
+            let view = get_as(
+                &app,
+                &format!("/api/oauth/link/{ticket}"),
+                Some(&guest_cookie),
+            )
+            .await;
             assert_eq!(view.status, StatusCode::OK, "{}", view.body);
             assert_eq!(view.json()["guest"], true);
             assert_eq!(view.json()["privy"]["app_id"], "app_test");
-            let link_cookie = cookie_of(&view);
+            let link_cookie = format!("{}; {guest_cookie}", cookie_of(&view));
 
             // No sign-in, no link.
             let anon = post_json_as(
@@ -3875,7 +4521,12 @@ mod tests {
 
             // The guest's token now pays from that wallet; the ticket is spent.
             assert!(topup_text(&app, &access).await.contains(ADDRESS));
-            let spent = get(&app, &format!("/api/oauth/link/{ticket}")).await;
+            let spent = get_as(
+                &app,
+                &format!("/api/oauth/link/{ticket}"),
+                Some(&guest_cookie),
+            )
+            .await;
             assert_eq!(spent.status, StatusCode::NOT_FOUND);
 
             // It belongs to the session that attached the wallet now.
@@ -3883,6 +4534,73 @@ mod tests {
                 post_json_with(&app, "/api/session/logout", json!({}), None, Some(&token)).await;
             assert_eq!(out.status, StatusCode::NO_CONTENT);
             assert!(state.oauth().unwrap().authenticate(&access).is_none());
+        }
+
+        /// connect/07: a guest's wallet-link URL forwarded to someone else
+        /// is refused in their browser, so their sign-in cannot attach their
+        /// wallet to the sender's connection.
+        #[tokio::test]
+        async fn a_forwarded_link_cannot_attach_the_openers_wallet() {
+            let (app, state, fake, mock) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let approved = post_json_as(
+                &app,
+                &approve_path(&request_id),
+                json!({ "guest": true }),
+                None,
+            )
+            .await;
+            let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+            let code = redirect
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            let tokens = post_form(
+                &app,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &client_id),
+                    ("code", &code),
+                    ("code_verifier", VERIFIER),
+                ],
+            )
+            .await;
+            let access = tokens.json()["access_token"].as_str().unwrap().to_string();
+            let refused = topup_message(&app, &access).await;
+            let message = refused["error"]["message"].as_str().unwrap().to_string();
+            let ticket = message
+                .split("?link=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string();
+
+            // The victim's browser: never approved that guest.
+            let path = format!("/api/oauth/link/{ticket}");
+            let view = get(&app, &path).await;
+            assert_eq!(view.status, StatusCode::FORBIDDEN, "{}", view.body);
+            assert_eq!(view.json()["error"], "other_browser");
+            let link_cookie = state.tenants().link_cookie(&ticket, true);
+            let link_cookie = link_cookie.to_str().unwrap().split(';').next().unwrap();
+            let linked = post_json_with(
+                &app,
+                &path,
+                json!({ "confirm": true }),
+                Some(link_cookie),
+                Some(&fake.token_for(USER)),
+            )
+            .await;
+            assert_eq!(linked.status, StatusCode::FORBIDDEN, "{}", linked.body);
+            assert_eq!(linked.json()["error"], "other_browser");
+            assert!(state.tenants().is_empty(), "nothing bound to the guest");
+            assert_eq!(mock.created.lock().unwrap().len(), 0);
+            let still = topup_message(&app, &access).await;
+            assert!(still["error"].is_object(), "the guest still cannot pay");
         }
 
         /// The subject cookie is a shortcut to a Privy login, not a login of
