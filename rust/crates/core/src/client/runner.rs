@@ -766,7 +766,12 @@ impl RunOutcome {
     ///
     /// This comes from the 402 challenge rather than the currently active
     /// account, which may belong to an unrelated network.
-    pub fn payment_network(&self, network_override: Option<&str>) -> Result<Option<String>> {
+    pub fn payment_network(
+        &self,
+        store: &dyn crate::accounts::AccountsStore,
+        network_override: Option<&str>,
+        account_override: Option<&str>,
+    ) -> Result<Option<String>> {
         let network = match self {
             RunOutcome::MppChallenge { challenge, .. }
             | RunOutcome::SessionChallenge { challenge, .. }
@@ -783,7 +788,7 @@ impl RunOutcome {
                 x402::scheme_network(&challenge.requirements.network, network_override)
             }
             RunOutcome::X402SignInChallenge { challenge, .. } => {
-                x402::sign_in_chain(challenge, network_override)?.1
+                x402::sign_in_chain(challenge, store, network_override, account_override)?.1
             }
             _ => return Ok(None),
         };
@@ -882,7 +887,7 @@ impl RunOutcome {
                     .unwrap_or(request.method_details.network)
             }
             RunOutcome::X402SignInChallenge { challenge, .. } => {
-                match x402::sign_in_chain(challenge, network_override) {
+                match x402::sign_in_chain(challenge, store, network_override, account_override) {
                     Ok((_, network)) => network,
                     Err(_) => return Ok(None),
                 }
@@ -4412,12 +4417,19 @@ HTTP request sent, awaiting response...
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
         assert_eq!(
-            outcome.payment_network(None).unwrap().as_deref(),
+            outcome
+                .payment_network(&crate::accounts::MemoryAccountsStore::new(), None, None)
+                .unwrap()
+                .as_deref(),
             Some("devnet")
         );
         assert_eq!(
             outcome
-                .payment_network(Some("localnet"))
+                .payment_network(
+                    &crate::accounts::MemoryAccountsStore::new(),
+                    Some("localnet"),
+                    None,
+                )
                 .unwrap()
                 .as_deref(),
             Some("localnet")
@@ -4905,8 +4917,7 @@ HTTP request sent, awaiting response...
     }
 
     #[cfg(feature = "ledger")]
-    #[test]
-    fn configured_signer_lets_a_ledger_account_pay_the_charge() {
+    fn ledger_mainnet_store() -> crate::accounts::MemoryAccountsStore {
         let mut file = crate::accounts::AccountsFile::default();
         file.upsert(
             "mainnet",
@@ -4925,7 +4936,13 @@ HTTP request sent, awaiting response...
                 subscriptions: Default::default(),
             },
         );
-        let store = crate::accounts::MemoryAccountsStore::with_file(file);
+        crate::accounts::MemoryAccountsStore::with_file(file)
+    }
+
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn configured_signer_lets_a_ledger_account_pay_the_charge() {
+        let store = ledger_mainnet_store();
         let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r");
         let support = outcome
             .configured_signer_support(&store, None, None)
@@ -4934,8 +4951,66 @@ HTTP request sent, awaiting response...
         assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
     }
 
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn configured_signer_pays_instead_of_signing_in_with_a_mainnet_ledger() {
+        // QuickNode lists devnet first; the sign-in must still resolve to the
+        // mainnet Ledger so it pays instead of failing to sign in.
+        let store = ledger_mainnet_store();
+        let headers = siwx_with_payment_402_on(&[
+            pay_kit::x402::exact::SOLANA_DEVNET,
+            pay_kit::x402::exact::SOLANA_MAINNET,
+        ]);
+        let outcome = classify_402(&headers, None, "https://e.com/r");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::X402SignInChallenge {
+                    payment_fallback: Some(_),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        assert_eq!(support, Some(false));
+        let outcome = outcome.for_signer_support(support);
+        assert!(
+            matches!(outcome, RunOutcome::X402Challenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn configured_signer_signs_in_on_devnet_without_a_mainnet_account() {
+        // Nothing configured: the sign-in answers on the first chain offered,
+        // where a throwaway devnet wallet can sign it.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let headers = siwx_with_payment_402_on(&[
+            pay_kit::x402::exact::SOLANA_DEVNET,
+            pay_kit::x402::exact::SOLANA_MAINNET,
+        ]);
+        let outcome = classify_402(&headers, None, "https://e.com/r");
+        let support = outcome
+            .configured_signer_support(&store, None, None)
+            .unwrap();
+        assert_eq!(support, None);
+        let outcome = outcome.for_signer_support(support);
+        assert!(
+            matches!(outcome, RunOutcome::X402SignInChallenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
     /// An x402 402 offering sign-in-with-x beside an exact payment.
     fn siwx_with_payment_402() -> Vec<(String, String)> {
+        siwx_with_payment_402_on(&[pay_kit::x402::exact::SOLANA_MAINNET])
+    }
+
+    /// Like [`siwx_with_payment_402`], signing in on `chains` in that order.
+    fn siwx_with_payment_402_on(chains: &[&str]) -> Vec<(String, String)> {
         use base64::Engine;
         let payment_required = serde_json::json!({
             pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
@@ -4958,11 +5033,14 @@ HTTP request sent, awaiting response...
                         "nonce": "nonce-123",
                         "issuedAt": "2026-04-27T00:00:00Z"
                     },
-                    "supportedChains": [{
-                        "chainId": pay_kit::x402::exact::SOLANA_MAINNET,
-                        "type": "ed25519",
-                        "signatureScheme": "siws"
-                    }]
+                    "supportedChains": chains
+                        .iter()
+                        .map(|chain| serde_json::json!({
+                            "chainId": chain,
+                            "type": "ed25519",
+                            "signatureScheme": "siws"
+                        }))
+                        .collect::<Vec<_>>()
                 }
             }
         });

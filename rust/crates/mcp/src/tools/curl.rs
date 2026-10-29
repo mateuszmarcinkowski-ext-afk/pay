@@ -1231,7 +1231,11 @@ fn do_paid_fetch(
     if scope.outbound_policy == pay_core::client::fetch::OutboundPolicy::PublicInternetOnly {
         reject_cross_origin_challenge(url, &outcome)?;
     }
-    if let Some(payment_network) = outcome.payment_network(network_override.as_deref())? {
+    if let Some(payment_network) = outcome.payment_network(
+        store,
+        network_override.as_deref(),
+        account_override.as_deref(),
+    )? {
         account_override =
             prepare_hardware_account(store, &payment_network, account_override, peer.as_ref())?;
     }

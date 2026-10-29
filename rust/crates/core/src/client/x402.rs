@@ -1260,7 +1260,7 @@ pub fn build_siwx_auth_header_with_override(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
-    let (chain, network) = sign_in_chain(challenge, network_override)?;
+    let (chain, network) = sign_in_chain(challenge, store, network_override, account_override)?;
     let desc = crate::client::prompt::payment_description(None, &[resource_url]);
     let intent = crate::keystore::AuthIntent::sign_in(format!(
         "sign in to {} ({}) with your wallet for {desc}",
@@ -1298,14 +1298,29 @@ pub fn build_siwx_auth_header_with_override(
 /// the forced network when given, else the Solana chain the challenge offers.
 pub(crate) fn sign_in_chain(
     challenge: &SiwxAuthChallenge,
+    store: &dyn AccountsStore,
     network_override: Option<&str>,
+    account_override: Option<&str>,
 ) -> Result<(pay_kit::x402::siwx::SupportedChain, String)> {
     let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
+    // Sign in on mainnet when an account is configured there (payments default
+    // to it, a Ledger lives there); otherwise on the first Solana chain offered,
+    // which a throwaway devnet wallet can answer.
+    let supported_chain_ids = if network_override.is_none()
+        && crate::signer::has_configured_account(
+            crate::accounts::MAINNET_NETWORK,
+            store,
+            account_override,
+        )? {
+        vec![SOLANA_MAINNET.to_string()]
+    } else {
+        vec![]
+    };
     let chain = pay_kit::x402::siwx::select_siwx_chain(
         &challenge.extension,
         &SiwxChainSelectionOptions {
             preferred_chain_id,
-            supported_chain_ids: vec![],
+            supported_chain_ids,
         },
     )
     .map_err(|e| Error::Mpp(format!("Failed to select x402 sign-in challenge: {e}")))?;
@@ -2884,6 +2899,80 @@ mod tests {
             "{:?}",
             seen[0]
         );
+    }
+
+    fn sign_in_challenge_on(chains: &[&str]) -> SiwxAuthChallenge {
+        let extension = pay_kit::x402::siwx::SiwxExtension::new(
+            pay_kit::x402::siwx::SiwxExtensionInfo {
+                domain: "api.example.com".to_string(),
+                uri: "https://api.example.com".to_string(),
+                statement: Some("Sign in.".to_string()),
+                version: "1".to_string(),
+                nonce: "nonce-123".to_string(),
+                issued_at: "2026-04-27T00:00:00Z".to_string(),
+                expiration_time: None,
+                not_before: None,
+                request_id: None,
+                resources: None,
+            },
+            chains
+                .iter()
+                .map(|chain| pay_kit::x402::siwx::SupportedChain::solana(*chain))
+                .collect(),
+        );
+        SiwxAuthChallenge::for_resource(extension, "https://api.example.com/").unwrap()
+    }
+
+    #[test]
+    fn sign_in_chain_prefers_mainnet_only_with_a_mainnet_account() {
+        let both = sign_in_challenge_on(&[SOLANA_DEVNET, SOLANA_MAINNET]);
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some(solana_pubkey::Pubkey::new_unique().to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let mainnet_store = MemoryAccountsStore::with_file(file);
+        let empty_store = MemoryAccountsStore::new();
+
+        let (chain, network) = sign_in_chain(&both, &mainnet_store, None, None).unwrap();
+        assert_eq!(network, "mainnet");
+        assert_eq!(chain.chain_id, SOLANA_MAINNET);
+
+        let (chain, network) = sign_in_chain(&both, &mainnet_store, Some("devnet"), None).unwrap();
+        assert_eq!(network, "devnet");
+        assert_eq!(chain.chain_id, SOLANA_DEVNET);
+
+        let devnet_only = sign_in_challenge_on(&[SOLANA_DEVNET]);
+        let (_, network) = sign_in_chain(&devnet_only, &mainnet_store, None, None).unwrap();
+        assert_eq!(network, "devnet");
+
+        let (chain, network) = sign_in_chain(&both, &empty_store, None, None).unwrap();
+        assert_eq!(network, "devnet");
+        assert_eq!(chain.chain_id, SOLANA_DEVNET);
+    }
+
+    #[test]
+    fn build_siwx_auth_header_signs_in_on_devnet_without_a_mainnet_account() {
+        let store = MemoryAccountsStore::new();
+        let challenge = sign_in_challenge_on(&[SOLANA_DEVNET, SOLANA_MAINNET]);
+
+        let built = build_siwx_auth_header(&challenge, &store, None, None, None).unwrap();
+        let payload = pay_kit::x402::siwx::parse_siwx_header(&built.headers[0].1).unwrap();
+
+        assert_eq!(payload.chain_id, SOLANA_DEVNET);
     }
 
     #[test]
