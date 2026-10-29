@@ -25,6 +25,7 @@ use pay_kit::x402::batch_settlement::{
 };
 use pay_kit::x402::client::batch_settlement::BatchChannel;
 use pay_kit::x402::solana_keychain::SolanaSigner;
+use pay_kit::x402::solana_keychain::memory::MemorySigner;
 
 // Re-exported so hosts (the MCP server, a proxy) can hold and confirm
 // batch-settlement state without taking a direct pay-kit dependency.
@@ -137,6 +138,10 @@ pub struct BatchChannelCache {
     /// escrow open/top-up is still approval-gated; requests spending capacity
     /// that was already approved must not reopen the keystore every time.
     signers: Arc<Mutex<HashMap<String, ResidentSigner>>>,
+    /// In-process voucher keys of client-signed channels a hardware wallet
+    /// funded, by the `payerAuthorizer` each was bound to at `open`. Kept for
+    /// the process lifetime: the key is all that can spend that escrow.
+    voucher_signers: Arc<Mutex<HashMap<String, Arc<MemorySigner>>>>,
 }
 
 /// A funded channel's signer and the origins whose requests were approved to
@@ -320,6 +325,23 @@ impl BatchChannelCache {
             .unwrap_or_default();
         origins.extend(origin_of(resource_url));
         signers.insert(key, ResidentSigner { signer, origins });
+        Ok(())
+    }
+
+    /// The in-process key bound as `authorizer` at a channel's `open`, if this
+    /// process generated it.
+    pub(crate) fn voucher_signer(&self, authorizer: &str) -> Result<Option<Arc<MemorySigner>>> {
+        let signers = self.voucher_signers.lock().map_err(|_| {
+            Error::Mpp("batch-settlement voucher key cache lock poisoned".to_string())
+        })?;
+        Ok(signers.get(authorizer).cloned())
+    }
+
+    pub(crate) fn insert_voucher_signer(&self, signer: Arc<MemorySigner>) -> Result<()> {
+        let mut signers = self.voucher_signers.lock().map_err(|_| {
+            Error::Mpp("batch-settlement voucher key cache lock poisoned".to_string())
+        })?;
+        signers.insert(SolanaSigner::pubkey(signer.as_ref()).to_string(), signer);
         Ok(())
     }
 
