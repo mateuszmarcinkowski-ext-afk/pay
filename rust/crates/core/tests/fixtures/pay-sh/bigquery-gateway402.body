@@ -1,0 +1,1 @@
+{"endpoint":{"method":"POST","path":"bigquery/v2/projects/x/queries"},"error":"payment_required","message":"This endpoint requires payment.","payment":{"schemes":["mpp/charge","x402/exact"]},"pricing":{"dimensions":[{"direction":"usage","price_usd":0.001,"scale":1,"unit":"requests"}]}}

@@ -1,0 +1,1 @@
+{"endpoint":{"method":"POST","path":"compatible-mode/v1/chat/completions"},"error":"payment_required","message":"This endpoint requires payment.","payment":{"schemes":["mpp/session","x402/upto"]},"pricing":{"dimensions":[{"direction":"input","price_usd":2.46,"scale":1000000,"unit":"tokens"},{"direction":"output","price_usd":7.37,"scale":1000000,"unit":"tokens"}]}}
