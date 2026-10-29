@@ -3,7 +3,7 @@
 //! Thin wrapper around `pay_kit::x402::client::exact` for challenge detection
 //! and payment building.
 
-use pay_kit::x402::solana_keychain::SolanaSigner;
+use pay_kit::x402::solana_keychain::{SolanaSigner, TransactionSigner};
 use pay_kit::x402::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::x402::{
     PAYMENT_REQUIRED_HEADER, X402_V1_PAYMENT_REQUIRED_HEADER, X402_VERSION_FIELD, X402_VERSION_V1,
@@ -1102,10 +1102,6 @@ pub fn build_batch_payment_checked(
         auth_override,
         cached_signer,
     )?;
-    // Vouchers are raw message signatures by the payer key; a hardware wallet
-    // cannot produce them. Charges and client-signed sessions still work.
-    signer.require_raw_message_signing("a batch-settlement voucher")?;
-
     // The advertised token program is checked against the mint's real owner:
     // every associated token address in the `open` derives from it, so trusting
     // a wrong value would escrow into accounts the program never touches.
@@ -1128,6 +1124,42 @@ pub fn build_batch_payment_checked(
         }
     }
 
+    // A voucher is a raw message signature, which a hardware wallet cannot
+    // produce. So it only funds a client-signed channel: an in-process key,
+    // bound as the channel's `payerAuthorizer` at `open`, signs every voucher
+    // and the device approves only the escrow. A server-signed channel needs a
+    // payer proof per request, which only the payer key can sign.
+    let delegate = match existing.as_ref() {
+        Some(channel)
+            if channel.config().voucher_signer.is_none()
+                && channel.config().payer_authorizer != channel.config().payer =>
+        {
+            Some(
+                cache
+                    .voucher_signer(&channel.config().payer_authorizer)?
+                    .ok_or_else(|| {
+                        Error::Mpp(
+                            "this process does not hold the batch-settlement channel's \
+                             voucher key"
+                                .to_string(),
+                        )
+                    })?,
+            )
+        }
+        Some(_) => None,
+        None if terms.operator.is_none() && !signer.signs_raw_messages() => {
+            Some(std::sync::Arc::new(fresh_voucher_signer()?))
+        }
+        None => None,
+    };
+    if delegate.is_none() {
+        signer.require_raw_message_signing("a batch-settlement voucher")?;
+    }
+    let voucher_signer: &dyn SolanaSigner = match delegate.as_deref() {
+        Some(delegate) => delegate,
+        None => signer.as_ref(),
+    };
+
     let (channel, payload, submission) = match existing {
         Some(channel) if channel.can_cover(price) => {
             let payload = if terms.operator.is_some() {
@@ -1138,7 +1170,7 @@ pub fn build_batch_payment_checked(
                 ))
                 .map_err(|e| Error::Mpp(format!("Failed to sign batch authorization: {e}")))?
             } else {
-                rt.block_on(channel.voucher_payload(signer.as_ref(), price))
+                rt.block_on(channel.voucher_payload(voucher_signer, price))
                     .map_err(|e| Error::Mpp(format!("Failed to sign batch voucher: {e}")))?
             };
             let submission = crate::client::batch::Submission::from_payload(&payload)?;
@@ -1154,15 +1186,24 @@ pub fn build_batch_payment_checked(
                 .deposit()
                 .checked_add(top_up)
                 .ok_or_else(|| Error::Mpp("batch-settlement deposit overflow".to_string()))?;
-            let payload = rt
-                .block_on(batch_client::build_top_up(
+            let payload = match delegate.as_deref() {
+                Some(delegate) => rt.block_on(build_delegated_top_up(
+                    signer.as_ref(),
+                    delegate,
+                    &channel,
+                    &terms,
+                    top_up,
+                    blockhash,
+                )),
+                None => rt.block_on(batch_client::build_top_up(
                     signer.as_ref(),
                     &channel,
                     &terms,
                     top_up,
                     blockhash,
-                ))
-                .map_err(|e| Error::Mpp(format!("Failed to build batch top-up: {e}")))?;
+                )),
+            }
+            .map_err(|e| Error::Mpp(format!("Failed to build batch top-up: {e}")))?;
             let submission = crate::client::batch::Submission::from_payload(&payload)?
                 .with_confirmed_deposit(confirmed_deposit);
             (channel, payload, submission)
@@ -1177,16 +1218,26 @@ pub fn build_batch_payment_checked(
                     .map_err(|e| Error::Mpp(format!("Failed to fetch slot: {e}")))?,
             };
             let deposit = escrow_amount.expect("open requires escrow authorization");
-            let (channel, payload) = rt
-                .block_on(batch_client::build_deposit(
+            let (channel, payload) = match delegate.as_deref() {
+                Some(delegate) => rt.block_on(build_delegated_deposit(
+                    signer.as_ref(),
+                    delegate,
+                    requirements,
+                    &terms,
+                    deposit,
+                    blockhash,
+                    open_slot,
+                )),
+                None => rt.block_on(batch_client::build_deposit(
                     signer.as_ref(),
                     requirements,
                     &terms,
                     deposit,
                     blockhash,
                     open_slot,
-                ))
-                .map_err(|e| Error::Mpp(format!("Failed to build batch deposit: {e}")))?;
+                )),
+            }
+            .map_err(|e| Error::Mpp(format!("Failed to build batch deposit: {e}")))?;
             let submission = crate::client::batch::Submission::from_payload(&payload)?
                 .with_confirmed_deposit(deposit);
             (channel, payload, submission)
@@ -1195,6 +1246,9 @@ pub fn build_batch_payment_checked(
 
     cache.insert(requirements, channel)?;
     cache.insert_signer(requirements, resource_url, signer.clone())?;
+    if let Some(delegate) = delegate {
+        cache.insert_voucher_signer(delegate)?;
+    }
     let header = batch_client::encode_payment_header(requirements, payload)
         .map_err(|e| Error::Mpp(format!("Failed to encode batch payment: {e}")))?;
     cache.register_submission(requirements, &submission)?;
@@ -1204,6 +1258,155 @@ pub fn build_batch_payment_checked(
             ephemeral_notice,
         },
         submission,
+    })
+}
+
+fn fresh_voucher_signer() -> Result<pay_kit::x402::solana_keychain::memory::MemorySigner> {
+    let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(key.as_bytes());
+    bytes[32..].copy_from_slice(key.verifying_key().as_bytes());
+    pay_kit::x402::solana_keychain::memory::MemorySigner::from_bytes(&bytes)
+        .map_err(|e| Error::Mpp(format!("Failed to build voucher signer: {e}")))
+}
+
+/// pay-kit's `build_deposit` with its one signer split in two: `signer` funds
+/// the `open`, `voucher_signer` is bound as the channel's `payerAuthorizer` and
+/// signs the first voucher. Client-signed channels only.
+#[allow(clippy::too_many_arguments)]
+async fn build_delegated_deposit(
+    signer: &dyn TransactionSigner,
+    voucher_signer: &dyn SolanaSigner,
+    requirements: &pay_kit::x402::batch_settlement::BatchRequirements,
+    terms: &pay_kit::x402::client::batch_settlement::BatchTerms,
+    deposit: u64,
+    blockhash: solana_hash::Hash,
+    open_slot: u64,
+) -> std::result::Result<
+    (
+        pay_kit::x402::client::batch_settlement::BatchChannel,
+        pay_kit::x402::batch_settlement::BatchPayload,
+    ),
+    pay_kit::x402::Error,
+> {
+    use pay_kit::core::payment_channels as pc;
+    use pay_kit::x402::batch_settlement::{BatchChannelConfig, BatchDeposit, BatchPayload};
+    use pay_kit::x402::client::batch_settlement::{BatchChannel, sign_voucher};
+
+    if deposit < terms.amount {
+        return Err(pay_kit::x402::Error::Other(
+            "deposit must cover at least one request".into(),
+        ));
+    }
+    let payer = signer.pubkey();
+    let authorizer = voucher_signer.pubkey();
+    if payer == terms.fee_payer || authorizer == terms.fee_payer {
+        return Err(pay_kit::x402::Error::Other(
+            "neither the channel payer nor its voucher signer may be the sponsor".into(),
+        ));
+    }
+    let salt = pc::random_salt();
+    let open = pc::build_open_payment_channel_tx_with_options(
+        signer,
+        &terms.fee_payer,
+        &terms.mint,
+        &authorizer,
+        salt,
+        open_slot,
+        deposit,
+        terms.withdraw_delay,
+        pc::sole_recipient(&terms.receiver),
+        &terms.token_program,
+        &pc::default_program_id(),
+        &terms.fee_payer,
+        blockhash,
+        &pc::OpenTxOptions {
+            memo: Some(terms.memo.clone()),
+            binding_memo: Some(terms.binding_memo.clone()),
+            version: terms.tx_version,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let config = BatchChannelConfig {
+        payer: pc::pubkey_string(&payer),
+        payer_authorizer: pc::pubkey_string(&authorizer),
+        receiver: requirements.pay_to.clone(),
+        receiver_authorizer: requirements.extra.receiver_authorizer.clone(),
+        token: requirements.asset.clone(),
+        withdraw_delay: terms.withdraw_delay,
+        salt: salt.to_string(),
+        open_slot,
+        voucher_signer: None,
+    };
+    let voucher = sign_voucher(voucher_signer, &open.channel_id, terms.amount).await?;
+    let channel = BatchChannel::new(open.channel_id, config.clone(), 0, deposit);
+    Ok((
+        channel,
+        BatchPayload::Deposit {
+            channel_config: config,
+            voucher: Some(voucher),
+            deposit: BatchDeposit {
+                amount: deposit.to_string(),
+                transaction: open.transaction,
+            },
+            authorization: None,
+        },
+    ))
+}
+
+/// pay-kit's `build_top_up` with its one signer split in two, as in
+/// [`build_delegated_deposit`].
+async fn build_delegated_top_up(
+    signer: &dyn TransactionSigner,
+    voucher_signer: &dyn SolanaSigner,
+    channel: &pay_kit::x402::client::batch_settlement::BatchChannel,
+    terms: &pay_kit::x402::client::batch_settlement::BatchTerms,
+    top_up: u64,
+    blockhash: solana_hash::Hash,
+) -> std::result::Result<pay_kit::x402::batch_settlement::BatchPayload, pay_kit::x402::Error> {
+    use pay_kit::core::payment_channels as pc;
+    use pay_kit::x402::batch_settlement::{BatchDeposit, BatchPayload};
+
+    let instructions = [
+        pc::build_top_up_instruction(
+            &signer.pubkey(),
+            channel.channel_id(),
+            &terms.mint,
+            top_up,
+            &terms.token_program,
+            &pc::default_program_id(),
+        ),
+        solana_instruction::Instruction {
+            program_id: pc::to_address(&pc::memo_program_id()),
+            accounts: vec![],
+            data: terms.continuation_memo.as_bytes().to_vec(),
+        },
+    ];
+    // Sign only the payer's slot; the sponsor co-signs before broadcast.
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        terms.tx_version,
+        &terms.fee_payer,
+        &instructions,
+        blockhash,
+        None,
+    )?;
+    pay_kit::core::signing::sign_versioned_transaction_slot(signer, &mut tx)
+        .await
+        .map_err(|e| pay_kit::x402::Error::Other(format!("transaction signing failed: {e}")))?;
+    let transaction = pay_kit::core::tx::encode(&tx)?;
+    let voucher = channel
+        .sign_next_voucher(voucher_signer, terms.amount)
+        .await?;
+    Ok(BatchPayload::Deposit {
+        channel_config: channel.config().clone(),
+        voucher: Some(voucher),
+        deposit: BatchDeposit {
+            amount: top_up.to_string(),
+            transaction,
+        },
+        authorization: None,
     })
 }
 
@@ -1483,6 +1686,124 @@ mod tests {
             crate::client::runner::RunOutcome::X402BatchChallenge { challenge, .. } => *challenge,
             other => panic!("expected a batch challenge, got {other:?}"),
         }
+    }
+
+    fn signer_from_seed(seed: u8) -> pay_kit::x402::solana_keychain::memory::MemorySigner {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(key.as_bytes());
+        bytes[32..].copy_from_slice(key.verifying_key().as_bytes());
+        pay_kit::x402::solana_keychain::memory::MemorySigner::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn delegated_deposit_and_top_up_never_make_the_voucher_key_a_signer() {
+        use pay_kit::x402::batch_settlement::{BatchPayload, check_voucher};
+        use pay_kit::x402::client::batch_settlement as batch_client;
+
+        let payer = signer_from_seed(7);
+        let authorizer = signer_from_seed(9);
+        let mut requirements = batch_challenge_with_min_deposit("10000").requirements;
+        requirements.extra.receiver_authorizer =
+            Some(solana_pubkey::Pubkey::new_from_array([4u8; 32]).to_string());
+        let terms = batch_client::resolve_terms_with_token_program(
+            &requirements,
+            requirements.extra.token_program.parse().unwrap(),
+            Some(pay_kit::core::tx::TxVersion::V0),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let open = |voucher_signer: &dyn SolanaSigner| {
+            rt.block_on(build_delegated_deposit(
+                &payer,
+                voucher_signer,
+                &requirements,
+                &terms,
+                10_000,
+                solana_hash::Hash::default(),
+                42,
+            ))
+            .unwrap()
+        };
+        // The wallet signs; the voucher key is only referenced as an account.
+        let assert_only_payer_signs = |transaction: &str, voucher_key_referenced: bool| {
+            let tx = pay_kit::core::tx::decode(transaction).unwrap();
+            let keys = tx.message.static_account_keys();
+            assert_eq!(tx.message.header().num_required_signatures, 2);
+            assert_eq!(
+                keys[0], terms.fee_payer,
+                "the sponsor must be the fee payer"
+            );
+            assert_eq!(keys[1], payer.pubkey(), "the wallet must be the payer");
+            assert_eq!(keys.contains(&authorizer.pubkey()), voucher_key_referenced);
+            if let Some(position) = keys.iter().position(|key| *key == authorizer.pubkey()) {
+                assert!(position >= 2, "the voucher key signs at index {position}");
+            }
+        };
+
+        let (channel, payload) = open(&authorizer);
+        let BatchPayload::Deposit {
+            channel_config,
+            voucher: Some(voucher),
+            deposit,
+            authorization: None,
+        } = payload
+        else {
+            panic!("an open must carry a deposit and its first voucher");
+        };
+        assert_eq!(channel_config.payer, payer.pubkey().to_string());
+        assert_eq!(
+            channel_config.payer_authorizer,
+            authorizer.pubkey().to_string()
+        );
+        assert_eq!(channel_config.voucher_signer, None);
+        assert_eq!(
+            check_voucher(&voucher, &channel_config, channel.channel_id()).unwrap(),
+            terms.amount
+        );
+        assert_only_payer_signs(&deposit.transaction, true);
+
+        let top_up = rt
+            .block_on(build_delegated_top_up(
+                &payer,
+                &authorizer,
+                &channel,
+                &terms,
+                5_000,
+                solana_hash::Hash::default(),
+            ))
+            .unwrap();
+        let BatchPayload::Deposit {
+            channel_config,
+            voucher: Some(voucher),
+            deposit,
+            authorization: None,
+        } = top_up
+        else {
+            panic!("a top-up must carry a deposit and a voucher");
+        };
+        assert_eq!(
+            check_voucher(&voucher, &channel_config, channel.channel_id()).unwrap(),
+            terms.amount
+        );
+        // A top-up names only the channel; the voucher key is not an account.
+        assert_only_payer_signs(&deposit.transaction, false);
+
+        // Negative control: without it the checks above would also pass if the
+        // voucher signer argument were ignored.
+        let (_, payload) = open(&payer);
+        let BatchPayload::Deposit {
+            channel_config,
+            deposit,
+            ..
+        } = payload
+        else {
+            panic!("an open must build a deposit payload");
+        };
+        assert_eq!(channel_config.payer, channel_config.payer_authorizer);
+        assert_only_payer_signs(&deposit.transaction, false);
     }
 
     #[test]
